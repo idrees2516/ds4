@@ -1,0 +1,55 @@
+name: cpu-tests
+
+# Model-free regression battery: builds the CPU-only binaries and runs the
+# no-GPU, no-model test surface (server parsing/rendering/streaming units,
+# GGUF type geometry, BPE heap differential, sampling reference comparison,
+# prompt-prefix and web-recovery units, and the tokenizer benchmark).
+# Backend-specific suites (Metal, CUDA, ROCm) run on their own hardware and
+# are not part of this job; see QA_BEFORE_RELEASES.md for those gates.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  cpu-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compiler info
+        run: cc --version | head -1
+
+      - name: Build CPU-only binaries (warning-free gate)
+        run: |
+          make cpu -j"$(nproc)" 2>&1 | tee build.log
+          ! grep -E "warning|error" build.log
+
+      - name: Run the model-free test battery
+        run: make cpu-test
+
+      - name: Additional no-model units
+        run: |
+          make tests/test_prompt_prefix tests/test_web_recovery tests/test_gpu_args \
+            tests/test_linux_memory tests/test_layer_pack ds4_test_cpu
+          ./tests/test_prompt_prefix
+          python3 tests/test_web_recovery.py ./tests/test_web_recovery
+          ./tests/test_gpu_args
+          ./tests/test_linux_memory
+          ./tests/test_layer_pack
+
+      - name: Tokenizer benchmark smoke (scaling sanity)
+        run: |
+          make bpe-tokenizer-bench
+          # The heap loop must stay near-linear; 32k chars must finish far
+          # under the old quadratic cost (4.7s on a fast desktop core).
+          ./speed-bench/bpe_tokenizer_bench
+
+      - name: Eval self-checks (no model)
+        run: |
+          make ds4-eval
+          ./ds4-eval --validate-cases
+          ./ds4-eval --self-test-extractors

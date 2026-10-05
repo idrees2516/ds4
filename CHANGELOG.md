@@ -194,3 +194,13 @@ with no GPU, no Metal, and no model, on any Linux machine (and CI). The
 QA gate previously treated CPU builds as compile-only; the no-model
 surface is now executable everywhere. Also adds
 `make bpe-tokenizer-bench`.
+
+### ci: GitHub Actions workflow runs the model-free battery on every push
+
+`cpu-tests.yml` builds the CPU-only binaries with the warning-free gate
+(`make cpu`), runs `make cpu-test`, the additional no-model units
+(prompt prefix, web recovery, gpu args, Linux memory, layer pack), the
+tokenizer benchmark, and the eval self-checks. Backend-specific suites
+(Metal, CUDA, ROCm) still run on their own hardware per
+QA_BEFORE_RELEASES.md; this job makes the platform-independent surface
+regression-gated on every push and pull request.
