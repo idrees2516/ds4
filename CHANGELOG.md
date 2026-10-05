@@ -118,3 +118,15 @@ Verified by `test_glm_template_low_effort_detection` (template detection
 on the opening lines of the official 5.3 Flash, Full 5.3 and 5.2
 templates) and `test_glm_reasoning_effort_levels` (per-level mapping for
 both generations). (Implements antirez/ds4#1160.)
+
+### server: advertise loaded model modalities on /v1/models
+
+`/v1/models` and `/v1/models/{id}` now carry an `architecture` object
+with `input_modalities` and `output_modalities`. Input includes `image`
+only when `ds4_engine_has_vision()` reports that the loaded engine is
+ready for vision; otherwise it contains only `text`. Output remains
+`text`, and compatibility aliases report the same loaded-engine
+capabilities, so discovery clients can configure image support
+automatically from whichever model id they resolved.
+Verified by `test_model_metadata_advertises_modalities` (text-only and
+vision metadata JSON shapes). (Implements antirez/ds4#1165.)

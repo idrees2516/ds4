@@ -15138,7 +15138,7 @@ typedef struct {
 } client_arg;
 
 static void append_model_json_values(buf *b, const char *id, const char *name,
-                                     int ctx, int default_tokens) {
+                                     int ctx, int default_tokens, bool vision) {
     const int max_completion = default_tokens < ctx ? default_tokens : ctx;
     buf_printf(b,
         "{\"id\":");
@@ -15151,6 +15151,9 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
     json_escape(b, name);
     buf_printf(b,
         ","
+        "\"architecture\":{"
+            "\"input_modalities\":[\"text\"%s],"
+            "\"output_modalities\":[\"text\"]},"
         "\"context_length\":%d,"
         "\"top_provider\":{"
             "\"context_length\":%d,"
@@ -15169,17 +15172,23 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
             "\"seed\","
             "\"stream\","
             "\"reasoning_effort\"]}",
+        vision ? ",\"image\"" : "",
         ctx,
         ctx,
         max_completion);
 }
 
 static void append_model_json(buf *b, const server *s, const char *id) {
+    /* Input includes image only when the loaded engine is ready for vision;
+     * output is text on every backend. Compatibility aliases report the same
+     * loaded-engine capabilities, so discovery clients configure image
+     * support from any model id they saw. */
     append_model_json_values(b,
                              id,
                              ds4_engine_model_name(s->engine),
                              s->ctx_size,
-                             s->default_tokens);
+                             s->default_tokens,
+                             ds4_engine_has_vision(s->engine));
 }
 
 static bool send_model(server *s, int fd, const char *id) {
@@ -18496,6 +18505,31 @@ static void test_glm_template_low_effort_detection(void) {
     TEST_ASSERT(!ds4_glm_template_supports_low_effort_str("no template", 11));
 }
 
+static void test_model_metadata_advertises_modalities(void) {
+    /* /v1/models and /v1/models/{id} advertise the loaded engine's
+     * modalities: input gains "image" only when vision is ready, output is
+     * always text. Both shapes are pinned so a discovery client can branch
+     * without loading a model. */
+    buf text_only = {0};
+    append_model_json_values(&text_only, "deepseek-v4-flash", "DeepSeek V4 Flash",
+                             8192, 4096, false);
+    TEST_ASSERT(strstr(text_only.ptr,
+        "\"input_modalities\":[\"text\"]") != NULL);
+    TEST_ASSERT(strstr(text_only.ptr,
+        "\"output_modalities\":[\"text\"]") != NULL);
+    TEST_ASSERT(strstr(text_only.ptr, "image") == NULL);
+    buf_free(&text_only);
+
+    buf vision = {0};
+    append_model_json_values(&vision, "deepseek-v4-flash", "DeepSeek V4 Flash",
+                             8192, 4096, true);
+    TEST_ASSERT(strstr(vision.ptr,
+        "\"input_modalities\":[\"text\",\"image\"]") != NULL);
+    TEST_ASSERT(strstr(vision.ptr,
+        "\"output_modalities\":[\"text\"]") != NULL);
+    buf_free(&vision);
+}
+
 static void test_glm_reasoning_effort_levels(void) {
     /* Per-level mapping for both template generations, plus the flag reset
      * so other tests observe the default (old) mapping. */
@@ -21428,7 +21462,7 @@ static void test_tool_history_validation_handles_large_replays(void) {
 static void test_model_metadata_clamps_completion_to_context(void) {
     buf b = {0};
     append_model_json_values(&b, "deepseek-v4-flash", "DeepSeek V4 Flash",
-                             32768, 393216);
+                             32768, 393216, false);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);
@@ -21437,7 +21471,7 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 
     append_model_json_values(&b, "deepseek-v4-pro", "DeepSeek V4 Pro",
-                             100000, 4096);
+                             100000, 4096, false);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);
@@ -23272,6 +23306,7 @@ static void ds4_server_unit_tests_run(void) {
     test_reasoning_effort_mapping();
     test_glm_template_low_effort_detection();
     test_glm_reasoning_effort_levels();
+    test_model_metadata_advertises_modalities();
     test_model_alias_thinking_controls();
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
