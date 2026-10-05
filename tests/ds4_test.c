@@ -14,6 +14,98 @@ static void test_bpe_heap_matches_reference(void) {
     TEST_ASSERT(ds4_test_bpe_heap_matches_reference());
 }
 
+static void test_ngram_propose(void) {
+    /* History: the pattern (10, 11, 12) occurs twice; the most recent
+     * occurrence is at index 5 and is followed by 13, 10, 11. */
+    int hist[] = {10, 11, 12, 13, 1, 10, 11, 12, 13, 10, 11};
+    const int hist_len = (int)(sizeof(hist) / sizeof(hist[0]));
+    int out[8];
+
+    /* n=3: pattern is the last two history tokens plus the incoming token
+     * (10, 11) + 12 -> most recent occurrence at 5, followed by 13, 10, 11. */
+    int n = ds4_ngram_propose(hist, hist_len, 12, 3, 8, out, 8);
+    TEST_ASSERT(n == 3);
+    if (n == 3) TEST_ASSERT(out[0] == 13 && out[1] == 10 && out[2] == 11);
+
+    /* Width caps the proposal. */
+    n = ds4_ngram_propose(hist, hist_len, 12, 3, 2, out, 8);
+    TEST_ASSERT(n == 2);
+    if (n == 2) TEST_ASSERT(out[0] == 13 && out[1] == 10);
+
+    /* An occurrence with no following token cannot be proposed from. */
+    n = ds4_ngram_propose(hist, hist_len, 11, 3, 8, out, 8);
+    TEST_ASSERT(n == 0);   /* pattern (10,11)+11 never occurs with a tail */
+
+    /* n=2: pattern is the last history token plus the incoming token,
+     * (11, 11) here, which never occurs earlier. A shorter n anchors less:
+     * n=1 matches single 11 occurrences and proposes their tails. */
+    n = ds4_ngram_propose(hist, hist_len, 11, 2, 8, out, 8);
+    TEST_ASSERT(n == 0);
+    n = ds4_ngram_propose(hist, hist_len, 13, 1, 8, out, 8);
+    TEST_ASSERT(n == 2);
+    if (n == 2) TEST_ASSERT(out[0] == 10 && out[1] == 11);
+
+    /* No earlier occurrence: nothing to propose. */
+    int single[] = {7, 8, 9};
+    TEST_ASSERT(ds4_ngram_propose(single, 3, 8, 3, 8, out, 8) == 0);
+    TEST_ASSERT(ds4_ngram_propose(single, 3, 9, 3, 8, out, 8) == 0);
+
+    /* Most-recent-wins: the trailing pattern is the last two tokens
+     * (5, 6) plus next 7 -> (5, 6, 7), occurring at starts 0 and 4;
+     * the later occurrence (start 4) is proposed with tail (2, 5, 6). */
+    int repeat[] = {5, 6, 7, 1, 5, 6, 7, 2, 5, 6};
+    n = ds4_ngram_propose(repeat, 10, 7, 3, 8, out, 8);
+    TEST_ASSERT(n == 3);
+    if (n == 3) TEST_ASSERT(out[0] == 2 && out[1] == 5 && out[2] == 6);
+
+    /* Match-length sensitivity: n=3 pattern (3, 9, 4) never occurs; the
+     * n=2 pattern (9, 4) occurs at 0 with tail (3, 9). */
+    int degrade[] = {9, 4, 3, 9};
+    TEST_ASSERT(ds4_ngram_propose(degrade, 4, 4, 3, 8, out, 8) == 0);
+    n = ds4_ngram_propose(degrade, 4, 4, 2, 8, out, 8);
+    TEST_ASSERT(n == 2);
+    if (n == 2) TEST_ASSERT(out[0] == 3 && out[1] == 9);
+
+    /* Degenerate inputs. */
+    TEST_ASSERT(ds4_ngram_propose(NULL, 3, 5, 3, 8, out, 8) == 0);
+    TEST_ASSERT(ds4_ngram_propose(hist, 0, 5, 3, 8, out, 8) == 0);
+    TEST_ASSERT(ds4_ngram_propose(hist, hist_len, 12, 3, 0, out, 8) == 0);
+    TEST_ASSERT(ds4_ngram_propose(hist, hist_len, 12, 3, 8, NULL, 8) == 0);
+}
+
+static void test_dspark_scheduler_backoff_ladder(void) {
+    /* Ladder: the first MIN_STREAK-1 misses stay unpunished, then the
+     * pause doubles from BASE until CAP. */
+    TEST_ASSERT(ds4_dspark_sched_backoff_pause(0, 2, 64, 2) == 0);
+    TEST_ASSERT(ds4_dspark_sched_backoff_pause(1, 2, 64, 2) == 0);
+    TEST_ASSERT(ds4_dspark_sched_backoff_pause(2, 2, 64, 2) == 2);
+    TEST_ASSERT(ds4_dspark_sched_backoff_pause(3, 2, 64, 2) == 4);
+    TEST_ASSERT(ds4_dspark_sched_backoff_pause(4, 2, 64, 2) == 8);
+    TEST_ASSERT(ds4_dspark_sched_backoff_pause(5, 2, 64, 2) == 16);
+    TEST_ASSERT(ds4_dspark_sched_backoff_pause(6, 2, 64, 2) == 32);
+    TEST_ASSERT(ds4_dspark_sched_backoff_pause(7, 2, 64, 2) == 64);
+    /* Cap holds for arbitrarily long streaks. */
+    TEST_ASSERT(ds4_dspark_sched_backoff_pause(100, 2, 64, 2) == 64);
+    /* BASE 0 disables the ladder entirely. */
+    TEST_ASSERT(ds4_dspark_sched_backoff_pause(50, 0, 64, 2) == 0);
+    /* Non-power-of-two caps clamp, never overshoot. */
+    TEST_ASSERT(ds4_dspark_sched_backoff_pause(10, 2, 40, 2) <= 40);
+    TEST_ASSERT(ds4_dspark_sched_backoff_pause(10, 3, 64, 1) <= 64);
+    TEST_ASSERT(ds4_dspark_sched_backoff_pause(10, 3, 64, 1) > 0);
+    /* UINT32_MAX shifts cannot overflow into a small value. */
+    TEST_ASSERT(ds4_dspark_sched_backoff_pause(UINT32_MAX, 2, 64, 2) == 64);
+
+    /* Credit: one per accepted cycle, two for a full-width accept,
+     * capped. cap 0 disables accrual. */
+    TEST_ASSERT(ds4_dspark_sched_credit_add(0, 0, 5, 16) == 0);
+    TEST_ASSERT(ds4_dspark_sched_credit_add(0, 2, 5, 16) == 1);
+    TEST_ASSERT(ds4_dspark_sched_credit_add(0, 5, 5, 16) == 2);
+    TEST_ASSERT(ds4_dspark_sched_credit_add(0, 7, 5, 16) == 2);
+    TEST_ASSERT(ds4_dspark_sched_credit_add(15, 2, 5, 16) == 16);
+    TEST_ASSERT(ds4_dspark_sched_credit_add(16, 5, 5, 16) == 16);
+    TEST_ASSERT(ds4_dspark_sched_credit_add(4, 5, 5, 0) == 0);
+}
+
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
 #include <math.h>
@@ -7241,6 +7333,8 @@ static const ds4_test_entry test_entries[] = {
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
     {"--gguf-types", "gguf-types", "GGUF quant type block geometry matches ggml block structs", test_gguf_type_geometry},
     {"--bpe", "bpe", "heap BPE merge loop matches the reference O(n^2) loop token-for-token", test_bpe_heap_matches_reference},
+    {"--ngram", "ngram", "n-gram prompt-lookup draft proposal units", test_ngram_propose},
+    {"--dspark-scheduler", "dspark-scheduler", "speculative scheduler back-off ladder and credit units", test_dspark_scheduler_backoff_ladder},
 };
 
 static void test_print_help(const char *prog) {

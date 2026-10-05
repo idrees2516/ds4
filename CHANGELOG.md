@@ -204,3 +204,46 @@ tokenizer benchmark, and the eval self-checks. Backend-specific suites
 (Metal, CUDA, ROCm) still run on their own hardware per
 QA_BEFORE_RELEASES.md; this job makes the platform-independent surface
 regression-gated on every push and pull request.
+
+### speculative: n-gram prompt-lookup drafting (--ngram-spec N)
+
+Opt-in draft source for greedy decoding: find the most recent earlier
+occurrence of the trailing context (the last two session tokens plus the
+incoming argmax token) and propose the tokens that followed it, up to N
+per cycle. Drafts go through the existing DSpark batched verifier — a
+draft commits only if the target's recomputed argmax agrees, so greedy
+decoding is lossless with respect to the verifier's own logits — and
+reuse the commit/rollback machinery and back-off scheduler. No learned
+drafter runs; the proposal is a pure history lookup (like DSpark, the
+support GGUF still provides the verifier via --mtp-model).
+
+Width 5 is recommended: it matches the verifier prefix slots, wider
+widths pay rollback replays. Gains scale with context repetition density
+(+19% on code-shaped prompts per the issue's M5 Max measurements,
+neutral to slightly negative on sparse prose). The flag is wired into
+ds4, ds4-agent, ds4-bench and ds4-server, with help text for all four.
+Accepted tokens keep the batched verifier's state, so long greedy
+continuations need not be byte-identical to target-only decode (same
+contract as --dspark, documented in docs/SPECULATIVE_DECODING.md).
+The pure proposal lookup is unit-tested without a model
+(`ds4_test --ngram`), and
+`tests/ngram_spec_acceptance_fixture.sh` pins the short-prompt
+byte-identical contract on release hardware.
+(Implements antirez/ds4#1167.)
+
+### speculative: scheduler backs off exponentially on rejected proposals
+
+Consecutive rejected proposals now double the drafting pause (2, 4, 8,
+... up to 64 cycles); the first miss is left unpunished because an
+echoed pattern usually re-locks on the very next proposal. Accepted
+cycles accrue credit (one per accepted cycle, two for a full-width
+accept, capped at 16); a rejected proposal spends one credit instead of
+growing the miss streak, so long high-acceptance stretches keep
+drafting through isolated misses while dead passages still reach the
+ladder once credit runs out. Any accepted draft restores drafting
+immediately. The ladder governs DSpark and the n-gram drafter alike.
+Knobs: DS4_DSPARK_SCHEDULER_EXP_BACKOFF_BASE (0 restores the old flat
+pauses only), _CAP, _MIN_STREAK and _CREDIT (0 disables credit).
+The pure ladder and credit helpers are unit-tested without a model
+(`ds4_test --dspark-scheduler`); docs/SPECULATIVE_DECODING.md documents
+the behavior and the knobs. (Implements antirez/ds4#1168.)

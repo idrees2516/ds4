@@ -157,6 +157,10 @@ typedef struct {
     bool dspark_strict;
     bool dspark_exact_sampling;
     bool dspark_confidence_threshold_set;
+    /* N-gram prompt-lookup speculative drafting width (0 = off). Greedy
+     * decoding only; drafts reuse the DSpark batched verifier, commit/
+     * rollback machinery and back-off scheduler, with no draft weights. */
+    uint32_t ngram_spec;
     bool cuda_tensor_parallel;
     bool ssd_streaming;
     bool ssd_streaming_cold;
@@ -322,6 +326,27 @@ const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode);
 bool ds4_glm_template_supports_low_effort_str(const char *tmpl, size_t len);
 bool ds4_glm_template_low_effort_enabled(void);
 void ds4_glm_template_low_effort_set_for_test(bool on);
+
+/* N-gram prompt-lookup draft proposal: find the most recent earlier
+ * occurrence of the pattern [hist[hist_len-n+1 .. hist_len), next_token]
+ * in hist and copy up to `width` tokens that followed it into out.
+ * Returns the number of proposed tokens (0 when no earlier occurrence
+ * has a following token). Pure function; no engine or GPU required. */
+int ds4_ngram_propose(const int *hist, int hist_len, int next_token,
+                      int n, int width, int *out, int out_cap);
+
+/* Speculative scheduler back-off ladder, pure so it is unit-testable:
+ * consecutive rejected proposals double the drafting pause starting at
+ * `base` (2, 4, 8, ...), capped at `cap`; the first `min_streak` - 1
+ * misses stay unpunished. base == 0 disables the ladder (0 pause). */
+uint32_t ds4_dspark_sched_backoff_pause(uint32_t miss_streak,
+                                        uint32_t base, uint32_t cap,
+                                        uint32_t min_streak);
+/* Credit an accepted cycle: one credit per accepted cycle, two for a
+ * full-width accept (accepted >= width), capped at `cap`. A cap of 0
+ * disables accrual. */
+uint32_t ds4_dspark_sched_credit_add(uint32_t credit, uint32_t accepted,
+                                     uint32_t width, uint32_t cap);
 uint32_t ds4_think_max_min_context(void);
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size);
 /* Uses the active model shape selected by ds4_engine_open(); call after opening

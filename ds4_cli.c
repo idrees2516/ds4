@@ -2029,6 +2029,10 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.glm_mtp_timing = true;
         } else if (!strcmp(arg, "--dspark")) {
             c.engine.dspark = true;
+        } else if (!strcmp(arg, "--ngram-spec")) {
+            c.engine.dspark = true;
+            c.engine.ngram_spec =
+                parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--dspark-confidence")) {
             c.engine.dspark = true;
             c.engine.dspark_confidence_threshold =

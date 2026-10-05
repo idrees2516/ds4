@@ -191,8 +191,10 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
             opt(fp, c, "--dspark-confidence F", "Enable DSpark with confidence pruning threshold 0..1. Greedy/opportunistic default: Metal 0.6, CUDA/ROCm 0.7; exact sampling: 0.8");
             opt(fp, c, "--mtp-exact-sampling", "Preserve the ordinary temperature distribution instead of accepting target-matching greedy drafts directly.");
             opt(fp, c, "--dspark-strict", "Load DSpark support but keep target-only decode.");
+            opt(fp, c, "--ngram-spec N", "N-gram prompt-lookup speculative drafting width for greedy decoding (recommended: 5). Needs --mtp-model like --dspark; the n-gram source replaces the learned drafter.");
         } else if (tool == DS4_HELP_BENCH) {
             opt(fp, c, "--dspark", "Benchmark greedy DSpark using the support GGUF passed with --mtp-model.");
+            opt(fp, c, "--ngram-spec N", "Benchmark greedy n-gram prompt-lookup speculative drafting (recommended width: 5). Needs --mtp-model like --dspark.");
             opt(fp, c, "--dspark-confidence F", "DSpark confidence pruning threshold 0..1.");
         }
         opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");

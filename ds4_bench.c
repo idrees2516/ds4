@@ -71,6 +71,8 @@ typedef struct {
     bool show_output;
     bool teacher_forced_decode;
     bool dspark;
+    /* N-gram prompt-lookup speculative drafting width (0 = off). */
+    uint32_t ngram_spec;
     bool dspark_confidence_threshold_set;
     float dspark_confidence_threshold;
 } bench_config;
@@ -270,6 +272,10 @@ static bench_config parse_options(int argc, char **argv) {
             c.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-model")) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--ngram-spec")) {
+            c.dspark = true;
+            c.ngram_spec =
+                parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--dspark")) {
             c.dspark = true;
         } else if (!strcmp(arg, "--dspark-confidence")) {
@@ -661,6 +667,7 @@ int main(int argc, char **argv) {
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
         .dspark = cfg.dspark,
+        .ngram_spec = cfg.ngram_spec,
         .dspark_confidence_threshold = cfg.dspark_confidence_threshold,
         .dspark_confidence_threshold_set = cfg.dspark_confidence_threshold_set,
         .cuda_tensor_parallel = cfg.cuda_tensor_parallel,

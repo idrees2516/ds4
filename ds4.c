@@ -42352,6 +42352,8 @@ struct ds4_engine {
     bool dspark;
     bool dspark_strict;
     bool dspark_exact_sampling;
+    /* N-gram prompt-lookup speculative drafting width (0 = off). */
+    uint32_t ngram_spec;
     bool cuda_tensor_parallel;
     bool glm_tp_token_prefill;
     bool ssd_streaming;
@@ -60563,6 +60565,78 @@ static void ds4_acquire_instance_lock(void) {
     atexit(ds4_release_instance_lock);
 }
 
+/* N-gram prompt-lookup draft proposal. The pattern is the last n-1 tokens
+ * of the history plus the incoming next token (greedy decoding knows the
+ * argmax before evaluating it, so it can anchor the match). Search backward
+ * so the most recent earlier occurrence wins: echoed context is usually the
+ * closest repetition, and older matches are staler. Pure and allocation
+ * free; kept outside the GPU guard so the CPU build and tests reach it. */
+int ds4_ngram_propose(const int *hist, int hist_len, int next_token,
+                      int n, int width, int *out, int out_cap) {
+    if (!hist || hist_len <= 0 || !out || out_cap <= 0 || width <= 0 ||
+        n <= 0) {
+        return 0;
+    }
+    if (n < 1) n = 1;
+
+    /* pattern = [hist[hist_len-(n-1) .. hist_len), next_token] */
+    const int ctx = n - 1 < hist_len ? n - 1 : hist_len;
+    const int pat_len = ctx + 1;
+
+    /* Earliest viable occurrence start: i + pat_len + 1 <= hist_len keeps
+     * at least one following token to propose. */
+    const int last_start = hist_len - pat_len - 1;
+    for (int start = last_start; start >= 0; start--) {
+        bool match = true;
+        for (int j = 0; j < ctx; j++) {
+            if (hist[start + j] != hist[hist_len - ctx + j]) {
+                match = false;
+                break;
+            }
+        }
+        if (match && hist[start + ctx] == next_token) {
+            int proposed = 0;
+            for (int k = start + pat_len;
+                 k < hist_len && proposed < width && proposed < out_cap;
+                 k++) {
+                out[proposed++] = hist[k];
+            }
+            return proposed;
+        }
+    }
+    return 0;
+}
+
+/* N-gram prompt-lookup match length: the pattern is the last two session
+ * tokens plus the incoming argmax token. Three anchors echo code and agent
+ * replay shapes without matching trivial word bigrams everywhere. */
+#define DS4_NGRAM_SPEC_MATCH 3
+
+/* Back-off ladder: 0 for the unpunished prefix, then base << (streak -
+ * min_streak) capped. base == 0 disables the ladder entirely. */
+uint32_t ds4_dspark_sched_backoff_pause(uint32_t miss_streak,
+                                        uint32_t base, uint32_t cap,
+                                        uint32_t min_streak) {
+    if (base == 0) return 0;
+    if (miss_streak < min_streak) return 0;
+    const uint32_t shifts = miss_streak - min_streak;
+    uint32_t pause = base;
+    for (uint32_t i = 0; i < shifts && pause < cap; i++) {
+        if (pause > cap / 2u) { pause = cap; break; }
+        pause *= 2u;
+    }
+    return pause > cap ? cap : pause;
+}
+
+uint32_t ds4_dspark_sched_credit_add(uint32_t credit, uint32_t accepted,
+                                     uint32_t width, uint32_t cap) {
+    if (cap == 0) return 0;
+    if (accepted == 0) return credit;
+    /* One credit per accepted cycle, two for a full-width accept. */
+    const uint32_t add = (width > 0 && accepted >= width) ? 2u : 1u;
+    return credit > cap - add ? cap : credit + add;
+}
+
 #ifndef DS4_NO_GPU
 typedef struct {
     uint32_t n_comp[DS4_MAX_LAYER];
@@ -60714,6 +60788,14 @@ struct ds4_session {
     bool dspark_sched_skipped_cycle;
     bool dspark_sched_long_accept_seen;
     bool dspark_sched_bypass;
+    /* Exponential back-off ladder state: consecutive rejected proposals
+     * grow miss_streak; accepted cycles accrue credit that absorbs isolated
+     * misses without pausing (see ds4_session_dspark_scheduler_note).
+     * last_proposed_width carries the width the current cycle proposed so
+     * a full-width accept earns double credit. */
+    uint32_t dspark_sched_miss_streak;
+    uint32_t dspark_sched_credit;
+    uint32_t dspark_last_proposed_width;
     bool dspark_last_confidence0_valid;
     ds4_dspark_spec_stats dspark_stats;
 #endif
@@ -60864,6 +60946,26 @@ static uint32_t ds4_dspark_scheduler_no_draft_skip_cycles(void) {
     return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_NO_DRAFT_SKIP", 3);
 }
 
+/* Exponential back-off knobs. BASE 0 restores the old flat pauses only.
+ * The first MIN_STREAK-1 misses stay unpunished: an echoed pattern usually
+ * re-locks on the very next proposal, and pausing there only shifts the
+ * drafting phase out of the repeating pattern. */
+static uint32_t ds4_dspark_scheduler_exp_backoff_base(void) {
+    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_EXP_BACKOFF_BASE", 2);
+}
+
+static uint32_t ds4_dspark_scheduler_exp_backoff_cap(void) {
+    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_EXP_BACKOFF_CAP", 64);
+}
+
+static uint32_t ds4_dspark_scheduler_exp_backoff_min_streak(void) {
+    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_EXP_BACKOFF_MIN_STREAK", 2);
+}
+
+static uint32_t ds4_dspark_scheduler_credit_cap(void) {
+    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_EXP_BACKOFF_CREDIT", 16);
+}
+
 static uint32_t ds4_dspark_scheduler_short_accept_no_draft_skip_cycles(void) {
     return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_SHORT_ACCEPT_NO_DRAFT_SKIP", 4);
 }
@@ -60894,12 +60996,16 @@ static void ds4_session_dspark_scheduler_reset(ds4_session *s) {
     s->dspark_sched_no_draft = 0;
     s->dspark_sched_extra_ms = 0.0;
     s->dspark_sched_saved_ms = 0.0;
+    s->dspark_sched_miss_streak = 0;
+    s->dspark_sched_credit = 0;
 }
 
 static void ds4_session_dspark_scheduler_begin_request(ds4_session *s) {
     if (!s) return;
     ds4_session_dspark_scheduler_reset(s);
     s->dspark_sched_skip = 0;
+    s->dspark_sched_miss_streak = 0;
+    s->dspark_sched_credit = 0;
     s->dspark_sched_lifetime_accepted = 0;
     s->dspark_sched_life_extra_ms = 0.0;
     s->dspark_sched_life_saved_ms = 0.0;
@@ -60953,6 +61059,46 @@ static void ds4_session_dspark_scheduler_note(
         }
     }
     if (no_draft) s->dspark_sched_no_draft++;
+
+    /* Exponential back-off on consecutive rejected proposals, with credit
+     * absorbing isolated misses. Governs every draft source (DSpark weights
+     * and n-gram alike); EXP_BACKOFF_BASE=0 restores the flat pauses only. */
+    {
+        const uint32_t credit_cap = ds4_dspark_scheduler_credit_cap();
+        const uint32_t backoff_base = ds4_dspark_scheduler_exp_backoff_base();
+        const uint32_t backoff_cap = ds4_dspark_scheduler_exp_backoff_cap();
+        const uint32_t min_streak =
+            ds4_dspark_scheduler_exp_backoff_min_streak();
+        if (accepted_drafts != 0) {
+            /* Any accepted draft restores drafting immediately; accepted
+             * cycles accrue credit (two for a full-width accept). */
+            s->dspark_sched_miss_streak = 0;
+            s->dspark_sched_credit = ds4_dspark_sched_credit_add(
+                s->dspark_sched_credit, accepted_drafts,
+                s->dspark_last_proposed_width ?
+                    s->dspark_last_proposed_width : 1u,
+                credit_cap);
+            /* Any accepted draft restores drafting immediately. */
+            s->dspark_sched_skip = 0;
+        } else if (!no_draft) {
+            /* A real proposal was rejected. Credit spends itself instead
+             * of growing the streak, so a long high-acceptance stretch
+             * keeps drafting through its isolated misses. */
+            if (credit_cap != 0 && s->dspark_sched_credit > 0) {
+                s->dspark_sched_credit--;
+            } else {
+                if (s->dspark_sched_miss_streak < UINT32_MAX) {
+                    s->dspark_sched_miss_streak++;
+                }
+                const uint32_t pause = ds4_dspark_sched_backoff_pause(
+                    s->dspark_sched_miss_streak, backoff_base, backoff_cap,
+                    min_streak);
+                if (pause != 0 && pause > s->dspark_sched_skip) {
+                    s->dspark_sched_skip = pause;
+                }
+            }
+        }
+    }
     if (extra_ms > 0.0 && isfinite(extra_ms)) {
         s->dspark_sched_extra_ms += extra_ms;
     }
@@ -70862,6 +71008,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->glm_mtp = opt->glm_mtp;
     e->glm_mtp_timing = opt->glm_mtp_timing;
     e->dspark = opt->dspark;
+    e->ngram_spec = opt->ngram_spec;
+    if (e->ngram_spec > 16) e->ngram_spec = 16;   /* verifier prefix slots */
     e->dspark_strict = opt->dspark_strict;
     e->dspark_exact_sampling = opt->dspark_exact_sampling;
     e->cuda_tensor_parallel = opt->cuda_tensor_parallel;
@@ -77129,6 +77277,49 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
         }
         return false;
     }
+    if (enabled && !fake_argmax_enabled && s->engine->ngram_spec != 0 &&
+        !stochastic_requested) {
+        /* N-gram prompt-lookup drafting: propose the tokens that followed
+         * the most recent earlier occurrence of the trailing context plus
+         * the incoming token. Greedy only (the drafter assumes the argmax
+         * seed); drafts reuse the batched verifier, commit/rollback and
+         * back-off scheduler, with no draft weights. */
+        const uint32_t verify_cap = ds4_dspark_env_u32(
+            "DS4_DSPARK_VERIFY_CAP",
+            ds4_session_dspark_rocm_gfx1151_fast_path(s) ? 5u : 0u);
+        const int width = s->engine->ngram_spec > DS4_DSPARK_MAX_BLOCK_SIZE
+            ? DS4_DSPARK_MAX_BLOCK_SIZE : (int)s->engine->ngram_spec;
+        int proposal[DS4_DSPARK_MAX_BLOCK_SIZE];
+        const int proposal_len = ds4_ngram_propose(
+                s->checkpoint.v, s->checkpoint.len, token,
+                DS4_NGRAM_SPEC_MATCH, width,
+                proposal, DS4_DSPARK_MAX_BLOCK_SIZE);
+        uint32_t draft_len = (uint32_t)proposal_len;
+        if (verify_cap != 0 && draft_len > verify_cap) draft_len = verify_cap;
+        if (draft_len > DS4_DSPARK_MAX_BLOCK_SIZE) {
+            draft_len = DS4_DSPARK_MAX_BLOCK_SIZE;
+        }
+        for (uint32_t i = 0; i < draft_len; i++) {
+            s->dspark_draft_tokens[i] = proposal[i];
+        }
+        s->dspark_draft_len = draft_len;
+        s->dspark_draft_valid = draft_len != 0;
+        s->dspark_stochastic_draft = false;
+        const double propose_ms =
+            time_enabled ? (now_sec() - stats_t0) * 1000.0 : 0.0;
+        if (scheduler_enabled) s->dspark_last_propose_ms = propose_ms;
+        if (stats_enabled) {
+            s->dspark_stats.propose_ms += propose_ms;
+            s->dspark_stats.no_draft += draft_len == 0 ? 1u : 0u;
+        }
+        if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
+            fprintf(stderr,
+                    "ds4: ngram spec propose len=%u width=%d pos=%u token=%d\n",
+                    draft_len, width, pos, token);
+        }
+        return s->dspark_draft_valid;
+    }
+
     if (probe_log || enabled) {
         const bool capture_ok = ds4_session_dspark_capture_current(s);
         const bool batch_capture_ok =
@@ -80744,6 +80935,7 @@ static int ds4_session_eval_dspark_speculative_argmax(
             }
         }
     }
+    s->dspark_last_proposed_width = (uint32_t)(draft_n - seed_tokens);
     if (stats_enabled) {
         s->dspark_stats.proposed_tokens += (uint64_t)(draft_n - seed_tokens);
         ds4_dspark_stats_note_len(s->dspark_stats.draft_len_hist,

@@ -45,6 +45,66 @@ Recorded comparisons are in [the QA guide](../QA_BEFORE_RELEASES.md).
 
 For the tested Strix Halo coding configuration, use `--dspark --dspark-confidence 0.7` with the default five-token draft cap and scheduler. Client sampling is temperature `1.0`, `top_p=0.95`, `min_p=0`, and `top_k=0`; high reasoning was also checked on coding and tool-use requests. This uses opportunistic sampling as described below; exact-mode throughput is not qualified by these measurements. `--mtp-draft` controls legacy autoregressive MTP, not the DSpark draft width.
 
+## N-gram prompt-lookup drafting
+
+`--ngram-spec N` (greedy decoding only) is an opt-in draft source that
+proposes the tokens that followed the most recent earlier occurrence of
+the trailing context: the last two session tokens plus the incoming argmax
+token. No learned drafter runs — the proposal is a pure history lookup —
+but the DSpark batched verifier, commit/rollback machinery and scheduler
+are reused, so a draft commits only if the target's recomputed argmax
+agrees and greedy decoding stays lossless with respect to the verifier's
+own logits.
+
+Load it exactly like DSpark (the support GGUF provides the verifier):
+
+```sh
+./ds4 --ngram-spec 5 --mtp-model gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
+```
+
+Width 5 is recommended: it matches the verifier prefix slots, and wider
+widths pay rollback replays. The flag is wired into `ds4`, `ds4-agent`,
+`ds4-bench` and `ds4-server`.
+
+Gains scale with context repetition density: code-shaped prompts and
+agent replay workloads see the largest speedups; sparse prose and
+reasoning prompts can be neutral to slightly negative. Accepted tokens
+keep the state produced by the batched verifier, whose floating-point
+reduction order can differ from one-token decode — long greedy
+continuations need not be byte-identical to target-only decode, exactly
+like `--dspark`. On the short acceptance prompts (<=256 tokens) output
+is byte-identical on/off; `tests/ngram_spec_acceptance_fixture.sh` pins
+that contract. For strict target-only comparison use `--quality` or
+`--dspark-strict`, which disable drafting.
+
+### Scheduler back-off
+
+Both draft sources (DSpark weights and n-gram) share the speculative
+scheduler. When drafting is unproductive, pauses now escalate
+exponentially: consecutive rejected proposals double the drafting pause
+(2, 4, 8, ... up to 64 cycles), while the first miss is left unpunished —
+an echoed pattern usually re-locks on the very next proposal, and pausing
+there only shifts the drafting phase out of the repeating pattern.
+
+Accepted cycles accrue credit (one per accepted cycle, two for a
+full-width accept, capped at 16). A rejected proposal spends one credit
+instead of growing the miss streak, so a long high-acceptance stretch
+keeps drafting through its isolated misses, while a genuinely dead
+passage still reaches the exponential ladder once the saved credit runs
+out. Any accepted draft restores drafting immediately.
+
+Knobs (all optional):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `DS4_DSPARK_SCHEDULER_EXP_BACKOFF_BASE` | 2 | Pause base; 0 restores the old flat pauses only |
+| `DS4_DSPARK_SCHEDULER_EXP_BACKOFF_CAP` | 64 | Maximum pause in cycles |
+| `DS4_DSPARK_SCHEDULER_EXP_BACKOFF_MIN_STREAK` | 2 | Misses before the ladder starts |
+| `DS4_DSPARK_SCHEDULER_EXP_BACKOFF_CREDIT` | 16 | Credit cap; 0 disables credit and keeps the bare miss-streak ladder |
+
+The pure ladder and credit helpers are unit-tested without a model via
+`ds4_test --dspark-scheduler`; the proposal lookup via `ds4_test --ngram`.
+
 ## GLM: built-in MTP
 
 GLM's draft block is already in its main GGUF:
