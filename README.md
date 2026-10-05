@@ -71,6 +71,17 @@ The software is currently very fast changing. Consider it beta quality.
 Before each release, a big QA run is executed, however instabilities
 and regressions are definitely possible.
 
+Every push runs the model-free regression battery (server units,
+tokenizer differential, GGUF geometry, speculative scheduler and
+sampling references) on CI:
+
+[![cpu-tests](https://github.com/idrees2516/ds4/actions/workflows/cpu-tests.yml/badge.svg)](https://github.com/idrees2516/ds4/actions/workflows/cpu-tests.yml)
+
+`make cpu-test` runs the same battery locally with no GPU and no model.
+
+Architecture is documented in [ARCHITECTURE.md](ARCHITECTURE.md) and
+per-change history in [CHANGELOG.md](CHANGELOG.md).
+
 # How to use this project?
 
 I (Salvatore) believe that the way projects should be shipped and used changed because of AI. The main differences today are:

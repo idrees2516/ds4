@@ -247,3 +247,15 @@ pauses only), _CAP, _MIN_STREAK and _CREDIT (0 disables credit).
 The pure ladder and credit helpers are unit-tested without a model
 (`ds4_test --dspark-scheduler`); docs/SPECULATIVE_DECODING.md documents
 the behavior and the knobs. (Implements antirez/ds4#1168.)
+
+### docs: ARCHITECTURE.md and the CPU benchmark surface
+
+Adds ARCHITECTURE.md: the design philosophy (narrow whole-model
+engine, correctness before speed, one production path per backend),
+repository map, the full execution path (load -> tokenize -> prefill
+-> decode -> serve/agent), backend table, cache inventory (live KV,
+disk KV, radix prompt cache, SSD streaming, image embedding cache),
+memory policy, concurrency model, and the three-layer testing
+strategy. The README links it, the CHANGELOG, and the CI badge; the
+speed-bench README gains the CPU-only benchmark section (tokenizer
+merge-loop table, sampling references, scheduler units).

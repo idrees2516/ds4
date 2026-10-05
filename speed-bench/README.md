@@ -144,3 +144,59 @@ Start the server separately with an appropriate model, context and
 `--batched-session 8`. The report includes first-token and inter-token
 latency, request latency and throughput. Prompts use fresh nonces;
 `--shared-prefix` tests cache reuse instead.
+
+
+## CPU-only benchmarks (no GPU, no model)
+
+These measure the engine's host-side algorithms and run in
+[CI](../.github/workflows/cpu-tests.yml). Hardware-specific decode and
+prefill numbers are the sections above.
+
+### Tokenizer merge loop (`bpe_tokenizer_bench`)
+
+The byte-level BPE merge loop historically rescanned every adjacent
+symbol pair per merge, which is O(n^2) on the long single pieces the
+pre-tokenizer produces for CJK text (a 24k-token request spent minutes
+in tokenization alone; see the changelog and antirez/ds4#853). The
+current implementation keeps a min-heap of candidate pair ranks with
+lazy validation; pop order (rank, then position) reproduces the original
+merge selection exactly, so tokenization is byte-identical.
+
+Reference run (this repository's CI-class x86 runner, single core):
+
+| chars | heap (ms) | rescan (ms) | speedup | match |
+| ---: | ---: | ---: | ---: | :--- |
+| 1000 | 0.18 | 3.8 | ~21x | identical |
+| 2000 | 0.34 | 15.4 | ~45x | identical |
+| 4000 | 0.71 | 65.2 | ~92x | identical |
+| 8000 | 1.44 | 274.7 | ~190x | identical |
+| 16000 | 3.12 | 1142.0 | ~366x | identical |
+| 32000 | 7.20 | 4757.7 | ~660x | identical |
+
+The old loop's time quadruples when the input doubles (quadratic); the
+heap loop roughly doubles (near-linear). "match" means the heap and the
+retained reference implementation emit identical token sequences at
+every size — also pinned by `ds4_test --bpe` over 2000 random pieces
+with colliding merge ranks.
+
+Run it:
+
+```
+make bpe-tokenizer-bench
+```
+
+### Sampling kernels (`tests/test_sampling`)
+
+The sampling path (softmax, top-k, top-p, min-p, residual correction)
+is checked against a float64 reference and timed on CPU; typical
+speedups of the optimized single-pass filter are 1.9x (default) to 9x
+(top-p+min-p) against the reference loop, with identical draws under
+the same RNG stream. Run via `make cpu-test`.
+
+### Speculative scheduler units (`ds4_test --dspark-scheduler`)
+
+The back-off ladder and credit helpers are pure functions; the unit test
+verifies the 2/4/8/.../64 pause ladder, caps, the unpunished first miss,
+reset-on-accept, credit accrual/absorption, and the kill switches
+(`DS4_DSPARK_SCHEDULER_EXP_BACKOFF_BASE=0`, `_CREDIT=0`). These run in
+microseconds and gate the scheduler's arithmetic on every push.
