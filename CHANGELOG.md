@@ -130,3 +130,31 @@ capabilities, so discovery clients can configure image support
 automatically from whichever model id they resolved.
 Verified by `test_model_metadata_advertises_modalities` (text-only and
 vision metadata JSON shapes). (Implements antirez/ds4#1165.)
+
+### server: reasoning deltas stream on token boundaries
+
+Streaming `/v1/chat/completions` (and the `/v1/responses` and
+`/v1/messages` reasoning surfaces) no longer split `reasoning_content`
+deltas at arbitrary byte offsets mid-token. The old logic held back a
+flat 7 bytes against the ` Watson` close marker, so the emit window
+moved with every appended token and cut wherever it landed ("1.  T" →
+"he use" → "r a" → ...). Reassembled text was correct, but clients that
+consume thinking deltas individually — reasoning-length estimation,
+per-token UIs, signature checks — saw garbage units, and every byte-sized
+delta carried full SSE+JSON overhead.
+
+The generator appends whole decoded pieces, so the hold now releases
+whole pieces and holds back only from the piece boundary at or before a
+possible close-marker prefix: `think_close_suffix_len()` finds the
+longest tail that can still grow into the marker, and the cut is aligned
+back to the last piece start (`think_piece_start` on all three stream
+states). Cuts never land mid-piece; each delta is one or more whole
+decoded tokens, mirroring the content path. The UTF-8 guard and the
+close/tool marker routing are unchanged, and reassembled reasoning text
+is byte-identical.
+
+`test_openai_stream_reasoning_deltas_are_token_aligned` feeds
+token-sized pieces (one ending in a byte that could start the marker)
+and requires whole-piece deltas; `test_openai_chat_stream_splits_
+reasoning_without_tools` now pins the token-aligned shape instead of
+the old 20-byte cut. (Implements antirez/ds4#685.)

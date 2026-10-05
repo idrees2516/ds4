@@ -1386,6 +1386,26 @@ static size_t utf8_stream_safe_len(const char *s, size_t start,
     return (limit - lead) < (size_t)need ? lead : limit;
 }
 
+/* Longest suffix of raw[start..raw_len) that is a proper prefix of the
+ * reasoning close marker (" Watson"). The generator appends whole decoded
+ * pieces, so while no marker is in sight the reasoning stream can emit every
+ * new piece whole; the only bytes that must be held back are the tail that
+ * could still grow into a close marker (at most 7). Holding exactly the
+ * matched suffix keeps every other cut on a token boundary, so reasoning
+ * deltas arrive one per decoded token instead of fragmented at arbitrary
+ * byte offsets, mirroring the content path. */
+static size_t think_close_suffix_len(const char *raw, size_t start,
+                                     size_t raw_len) {
+    static const char close[] = "\x3c\x2f\x74\x68\x69\x6e\x6b\x3e";
+    if (raw_len <= start) return 0;
+    const size_t n = sizeof(close) - 2;   /* longest proper prefix */
+    size_t max = raw_len - start < n ? raw_len - start : n;
+    for (size_t l = max; l > 0; l--) {
+        if (!memcmp(raw + raw_len - l, close, l)) return l;
+    }
+    return 0;
+}
+
 static bool parse_stream_options(const char **p, bool *include_usage) {
     json_ws(p);
     if (**p != '{') return json_skip_value(p);
@@ -7191,6 +7211,9 @@ typedef struct {
 typedef struct {
     openai_stream_mode mode;
     size_t emit_pos;
+    /* Start of the last piece seen while THINKING: cuts never land
+     * mid-piece, so reasoning deltas arrive on token boundaries. */
+    size_t think_piece_start;
     bool active;
     bool checked_think_prefix;
     bool guard_second_reasoning;
@@ -8056,8 +8079,21 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
         } else if (final) {
             limit = raw_len;
         } else {
-            const size_t hold = strlen("</think>") - 1;
-            limit = raw_len > hold ? raw_len - hold : st->emit_pos;
+            const size_t hold = think_close_suffix_len(raw, st->emit_pos, raw_len);
+            if (hold > 0) {
+                /* Token-aligned hold: a marker prefix may be growing at the
+                 * tail, so hold from the piece boundary at or before its
+                 * start. Cuts then never land mid-piece and reasoning
+                 * deltas arrive as whole decoded tokens, mirroring the
+                 * content path. */
+                size_t boundary = st->think_piece_start;
+                if (boundary > raw_len) boundary = raw_len;
+                limit = raw_len - hold;
+                if (limit > boundary) limit = boundary;
+                if (limit < st->emit_pos) limit = st->emit_pos;
+            } else {
+                limit = raw_len;
+            }
             limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
         }
 
@@ -8068,6 +8104,11 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
             st->sent_reasoning = true;
             st->emit_pos = limit;
         }
+
+        /* Record the piece boundary for the next call: the generator
+         * appends one decoded token per update, so raw_len is where the
+         * current piece ends. */
+        st->think_piece_start = raw_len;
 
         if (tool_before_close) {
             if (complete_tool) {
@@ -8213,6 +8254,7 @@ typedef enum {
 typedef struct {
     responses_stream_mode mode;
     size_t emit_pos;
+    size_t think_piece_start;
     bool active;
     bool checked_think_prefix;
     bool reasoning_item_opened;
@@ -8791,8 +8833,21 @@ static bool responses_sse_stream_update(int fd, const request *r,
         } else if (final) {
             limit = raw_len;
         } else {
-            const size_t hold = strlen("</think>") - 1;
-            limit = raw_len > hold ? raw_len - hold : st->emit_pos;
+            const size_t hold = think_close_suffix_len(raw, st->emit_pos, raw_len);
+            if (hold > 0) {
+                /* Token-aligned hold: a marker prefix may be growing at the
+                 * tail, so hold from the piece boundary at or before its
+                 * start. Cuts then never land mid-piece and reasoning
+                 * deltas arrive as whole decoded tokens, mirroring the
+                 * content path. */
+                size_t boundary = st->think_piece_start;
+                if (boundary > raw_len) boundary = raw_len;
+                limit = raw_len - hold;
+                if (limit > boundary) limit = boundary;
+                if (limit < st->emit_pos) limit = st->emit_pos;
+            } else {
+                limit = raw_len;
+            }
             limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
         }
 
@@ -8815,6 +8870,11 @@ static bool responses_sse_stream_update(int fd, const request *r,
             }
             st->emit_pos = limit;
         }
+
+        /* Record the piece boundary for the next call: the generator
+         * appends one decoded token per update, so raw_len is where the
+         * current piece ends. */
+        st->think_piece_start = raw_len;
 
         if (tool_before_close) {
             if (complete_tool) {
@@ -9208,6 +9268,7 @@ typedef struct {
     anthropic_block_type open_block;
     int next_index;
     size_t emit_pos;
+    size_t think_piece_start;
     bool active;
     bool checked_think_prefix;
     bool guard_second_reasoning;
@@ -9703,8 +9764,21 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
         } else if (final) {
             limit = raw_len;
         } else {
-            const size_t hold = strlen("</think>") - 1;
-            limit = raw_len > hold ? raw_len - hold : st->emit_pos;
+            const size_t hold = think_close_suffix_len(raw, st->emit_pos, raw_len);
+            if (hold > 0) {
+                /* Token-aligned hold: a marker prefix may be growing at the
+                 * tail, so hold from the piece boundary at or before its
+                 * start. Cuts then never land mid-piece and reasoning
+                 * deltas arrive as whole decoded tokens, mirroring the
+                 * content path. */
+                size_t boundary = st->think_piece_start;
+                if (boundary > raw_len) boundary = raw_len;
+                limit = raw_len - hold;
+                if (limit > boundary) limit = boundary;
+                if (limit < st->emit_pos) limit = st->emit_pos;
+            } else {
+                limit = raw_len;
+            }
             limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
         }
 
@@ -9716,6 +9790,11 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
             st->sent_thinking = true;
             st->emit_pos = limit;
         }
+
+        /* Record the piece boundary for the next call: the generator
+         * appends one decoded token per update, so raw_len is where the
+         * current piece ends. */
+        st->think_piece_start = raw_len;
 
         if (tool_before_close) {
             if (complete_tool) {
@@ -17579,6 +17658,64 @@ static void test_openai_stream_reroutes_second_reasoning_pass(void) {
     close(sv[1]);
 }
 
+static void test_openai_stream_reasoning_deltas_are_token_aligned(void) {
+    /* Reasoning deltas must carry whole decoded pieces, not arbitrary byte
+     * windows: feed the thinking stream token-sized pieces and require each
+     * emitted reasoning_content delta to be exactly one of the fed pieces
+     * (or the concatenation of pieces released after a held marker-prefix
+     * tail). Reassembly stays byte-identical either way; the unit matters
+     * for clients that consume deltas individually. */
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = false;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+
+    /* Piece 4 ends with a byte that could start the close marker; the hold
+     * must release the earlier pieces whole rather than cut inside them. */
+    static const char *pieces[] = {"1.  ", "The ", "user ", "a<", "sked ",
+                                   "to ", "say ", "hello."};
+    buf raw = {0};
+    for (size_t i = 0; i < sizeof(pieces) / sizeof(pieces[0]); i++) {
+        buf_puts(&raw, pieces[i]);
+        TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_align",
+                                             &st, raw.ptr, raw.len, false));
+    }
+    /* No close marker appeared: a final flush releases any held tail. */
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_align",
+                                         &st, raw.ptr, raw.len, true));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    /* Collect every reasoning delta and require each to be a whole piece
+     * (a piece, or pieces merged by a released hold). */
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"1.  \"") != NULL);
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"The \"") != NULL);
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"user \"") != NULL);
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"a<sked \"") != NULL);
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"to \"") != NULL);
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"say \"") != NULL);
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"hello.\"") != NULL);
+    /* Mid-token fragments of the fed pieces must not appear. */
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"he\"") == NULL);
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"1. \"") == NULL);
+
+    free(out);
+    buf_free(&raw);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 static void test_openai_qwen_tool_stream_sends_answer_before_finish(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -17983,18 +18120,19 @@ static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
     char *out = read_socket_text(sv[1]);
 
     const char *role = strstr(out, "\"role\":\"assistant\"");
-    const char *reasoning1 = strstr(out, "\"reasoning_content\":\"We need to generate \"");
-    const char *reasoning2 = strstr(out, "\"reasoning_content\":\"a title\"");
+    /* The whole thinking piece arrives as one token-aligned delta: no
+     * mid-token fragments, so the flat 20-byte cut the old test pinned
+     * ("We need to generate " / "a title") is gone. */
+    const char *reasoning = strstr(out, "\"reasoning_content\":\"We need to generate a title\"");
     const char *content = strstr(out, "\"content\":\"Free disk space check\"");
     const char *done = strstr(out, "data: [DONE]");
     TEST_ASSERT(role != NULL);
-    TEST_ASSERT(reasoning1 != NULL);
-    TEST_ASSERT(reasoning2 != NULL);
+    TEST_ASSERT(reasoning != NULL);
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"We need to generate \"") == NULL);
     TEST_ASSERT(content != NULL);
     TEST_ASSERT(done != NULL);
-    TEST_ASSERT(role < reasoning1);
-    TEST_ASSERT(reasoning1 < reasoning2);
-    TEST_ASSERT(reasoning2 < content);
+    TEST_ASSERT(role < reasoning);
+    TEST_ASSERT(reasoning < content);
     TEST_ASSERT(content < done);
     TEST_ASSERT(strstr(out, "\"content\":\"We need to generate a title") == NULL);
     TEST_ASSERT(strstr(out, "</think>") == NULL);
@@ -23357,6 +23495,7 @@ static void ds4_server_unit_tests_run(void) {
     test_anthropic_tool_stream_sends_live_tool_use();
     test_openai_tool_stream_sends_incremental_text();
     test_openai_stream_reroutes_second_reasoning_pass();
+    test_openai_stream_reasoning_deltas_are_token_aligned();
     test_openai_qwen_tool_stream_sends_answer_before_finish();
     test_qwen_stream_split_reasoning_close();
     test_openai_stream_usage_reports_cache_details();
