@@ -50,6 +50,7 @@ jobs:
 
       - name: Eval self-checks (no model)
         run: |
-          make ds4-eval
+          # ds4-eval is already built by the CPU-only target above; the
+          # default make target would try the CUDA link on Linux.
           ./ds4-eval --validate-cases
           ./ds4-eval --self-test-extractors
