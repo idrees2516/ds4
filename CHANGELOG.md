@@ -71,3 +71,27 @@ Responses-native clients) did not see the truncation.
 Verified by `test_responses_incomplete_reason_is_max_output_tokens`, which
 asserts the new string is present and the old one absent on both paths.
 (Implements antirez/ds4#1162.)
+
+### gguf: fix the iq1_s and iq4_nl block sizes in the type table
+
+The GGUF type table had two wrong entries, taken from neither ggml nor
+gguf-py's `GGML_QUANT_SIZES`:
+- `iq4_nl` was 256 values in 50 bytes; `block_iq4_nl` is 32 values in
+  18 bytes (a half scale plus 16 bytes of nibbles).
+- `iq1_s` was 110 bytes per block; `block_iq1_s` is 50 bytes (a half
+  scale, 32 bytes of qs, 16 bytes of qh).
+
+With the old entries every iq4_nl tensor was sized at about a third of
+its real length (and iq1_s at more than double), so third-party GGUFs
+storing n-gram tables or weights in these types failed to load or decoded
+garbage. The official ds4 GGUFs use neither type; ISTA-DASLab's
+Qwen3.8-Flash-Next GSQ-RCO GGUF stores its n-gram table and some weights
+as iq4_nl and now decodes correctly.
+
+Adds `ds4_test --gguf-types`, a no-model check of every quantized type's
+block geometry against sizes spelled from ggml's block structs.
+(Implements antirez/ds4#1156.)
+
+### docs: fix "gaol" -> "goal" in the README hardware section
+
+Typo fix only. (antirez/ds4#1173.)

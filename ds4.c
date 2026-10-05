@@ -2338,8 +2338,8 @@ static const gguf_type_info gguf_types[] = {
     [16] = {"iq2_xxs",256,  66},
     [17] = {"iq2_xs", 256,  74},
     [18] = {"iq3_xxs",256,  98},
-    [19] = {"iq1_s",  256, 110},
-    [20] = {"iq4_nl", 256,  50},
+    [19] = {"iq1_s",  256,  50},
+    [20] = {"iq4_nl",  32,  18},
     [21] = {"iq3_s",  256, 110},
     [22] = {"iq2_s",  256,  82},
     [23] = {"iq4_xs", 256, 136},
@@ -2352,6 +2352,54 @@ static const gguf_type_info gguf_types[] = {
     [30] = {"bf16",     1,   2},
     [39] = {"mxfp4",   32,  17},
 };
+
+/* Test hook for ds4_test --gguf-types: every quantized block geometry in the
+ * table, spelled from the ggml block structs so they match GGML_QUANT_SIZES
+ * in gguf-py. iq1_s is a half scale plus 32 qs bytes plus 16 qh bytes (50);
+ * iq4_nl is a half scale plus 16 nibble bytes for 32 values (18). Third-party
+ * GGUFs store n-gram tables and weights in these types, and a wrong entry
+ * sizes every such tensor wrong. No model is needed to run this. */
+bool ds4_test_gguf_type_geometry(void) {
+    static const struct { uint32_t type; uint32_t elems; uint32_t bytes; } expect[] = {
+        {0,  1, 4},    /* f32 */
+        {1,  1, 2},    /* f16 */
+        {2,  32, 18},  /* q4_0 */
+        {3,  32, 20},  /* q4_1 */
+        {6,  32, 22},  /* q5_0 */
+        {7,  32, 24},  /* q5_1 */
+        {8,  32, 34},  /* q8_0 */
+        {9,  32, 40},  /* q8_1 */
+        {10, 256, 84}, /* q2_k */
+        {11, 256, 110},/* q3_k */
+        {12, 256, 144},/* q4_k */
+        {13, 256, 176},/* q5_k */
+        {14, 256, 210},/* q6_k */
+        {15, 256, 292},/* q8_k */
+        {16, 256, 66}, /* iq2_xxs */
+        {17, 256, 74}, /* iq2_xs */
+        {18, 256, 98}, /* iq3_xxs */
+        {19, 256, 50}, /* iq1_s */
+        {20, 32, 18},  /* iq4_nl */
+        {21, 256, 110},/* iq3_s */
+        {22, 256, 82}, /* iq2_s */
+        {23, 256, 136},/* iq4_xs */
+        {24, 1, 1},    /* i8 */
+        {25, 1, 2},    /* i16 */
+        {26, 1, 4},    /* i32 */
+        {27, 1, 8},    /* i64 */
+        {28, 1, 8},    /* f64 */
+        {29, 256, 56}, /* iq1_m */
+        {30, 1, 2},    /* bf16 */
+        {39, 32, 17},  /* mxfp4 */
+    };
+    for (size_t i = 0; i < sizeof(expect) / sizeof(expect[0]); i++) {
+        const gguf_type_info *info = &gguf_types[expect[i].type];
+        if (!info->name || !info->name[0]) return false; /* hole in the table */
+        if (info->block_elems != expect[i].elems) return false;
+        if (info->block_bytes != expect[i].bytes) return false;
+    }
+    return true;
+}
 
 enum {
     DS4_TENSOR_F32      = 0,

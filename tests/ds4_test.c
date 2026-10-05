@@ -2,6 +2,13 @@
 #define DS4_SERVER_TEST_NO_MAIN
 #include <inttypes.h>
 #include "../ds4_server.c"
+
+bool ds4_test_gguf_type_geometry(void);
+
+static void test_gguf_type_geometry(void) {
+    TEST_ASSERT(ds4_test_gguf_type_geometry());
+}
+
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
 #include <math.h>
@@ -7227,6 +7234,7 @@ static const ds4_test_entry test_entries[] = {
     {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
+    {"--gguf-types", "gguf-types", "GGUF quant type block geometry matches ggml block structs", test_gguf_type_geometry},
 };
 
 static void test_print_help(const char *prog) {
