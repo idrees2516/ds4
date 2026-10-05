@@ -916,6 +916,10 @@ static ds4_shape g_ds4_shape = {
 };
 
 static bool g_ds4_flash_vision_exp = false;
+/* Set at model load: true when the embedded GLM chat template admits a
+ * 'low' reasoning effort level (GLM 5.3 Flash and Full). GLM 5.2 templates
+ * only know 'high'/'max', so low maps to high there, as before. */
+static bool g_ds4_glm_template_low_effort = false;
 
 static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 
@@ -6736,6 +6740,15 @@ static void config_validate_glm_dsa_model(const ds4_model *m) {
     g_ds4_shape = DS4_SHAPE_GLM52;
     memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
 
+    /* Full GLM 5.3 loads through this shape too; its template admits a
+     * low effort level while GLM 5.2 does not. Detect once at load. */
+    {
+        ds4_str tmpl = {0};
+        if (model_get_string(m, "tokenizer.chat_template", &tmpl) && tmpl.ptr)
+            g_ds4_glm_template_low_effort =
+                ds4_glm_template_supports_low_effort_str(tmpl.ptr, tmpl.len);
+    }
+
     const uint32_t n_layer = required_u32(m, "glm-dsa.block_count");
     const uint64_t n_ctx = required_u64_compat(m, "glm-dsa.context_length");
     const uint32_t n_embd = required_u32(m, "glm-dsa.embedding_length");
@@ -6832,6 +6845,14 @@ static void config_validate_glm53_layer_types(const ds4_model *m) {
 static void config_validate_glm53_model(const ds4_model *m) {
     g_ds4_shape = DS4_SHAPE_GLM53;
     memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+
+    /* GLM 5.3 Flash template: effective effort admits 'low'. */
+    {
+        ds4_str tmpl = {0};
+        if (model_get_string(m, "tokenizer.chat_template", &tmpl) && tmpl.ptr)
+            g_ds4_glm_template_low_effort =
+                ds4_glm_template_supports_low_effort_str(tmpl.ptr, tmpl.len);
+    }
 
     config_expect_u32("block_count", required_u32(m, "glm5-next.block_count"), DS4_N_LAYER);
     config_expect_u32("trunk_block_count", required_u32(m, "glm5-next.trunk_block_count"),
@@ -7197,6 +7218,7 @@ static void config_validate_qwen4_model(const ds4_model *m) {
 
 static void config_validate_model(const ds4_model *m) {
     g_ds4_flash_vision_exp = false;
+    g_ds4_glm_template_low_effort = false;
     ds4_str arch = {0};
     if (model_get_string(m, "general.architecture", &arch)) {
         if (ds4_streq(arch, "deepseek41")) {
@@ -43472,9 +43494,47 @@ static void chat_push_bos_sequence(const ds4_vocab *vocab, token_vec *out) {
         token_vec_push(out, vocab->sop_id);
 }
 
+/* Set at model load: see g_ds4_glm_template_low_effort near the top. */
+static const char *str_find_bounded(const char *hay, size_t len,
+                                     const char *needle, size_t needle_len) {
+    if (!hay || needle_len == 0 || len < needle_len) return NULL;
+    for (size_t i = 0; i + needle_len <= len; i++) {
+        if (!memcmp(hay + i, needle, needle_len)) return hay + i;
+    }
+    return NULL;
+}
+
+bool ds4_glm_template_supports_low_effort_str(const char *tmpl, size_t len) {
+    /* The official templates open the level selection with
+     *   {%- set effective_reasoning_effort = reasoning_effort if
+     *     reasoning_effort is defined and reasoning_effort in ['low','high']
+     *     else 'max' -%}
+     * GLM 5.2 instead branches on == 'high' and has no low level. Detecting
+     * the selection statement plus a quoted 'low' member covers both 5.3
+     * Flash (glm5-next) and Full 5.3 (glm-dsa) while leaving 5.2 false. */
+    const char *stmt = str_find_bounded(tmpl, len,
+                                         "effective_reasoning_effort", 26);
+    if (!stmt) return false;
+    size_t remain = len - (size_t)(stmt - tmpl);
+    if (remain > 256) remain = 256;
+    return str_find_bounded(stmt, remain, "'low'", 5) != NULL;
+}
+
+bool ds4_glm_template_low_effort_enabled(void) {
+    return g_ds4_glm_template_low_effort;
+}
+
+void ds4_glm_template_low_effort_set_for_test(bool on) {
+    g_ds4_glm_template_low_effort = on;
+}
+
 const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode) {
     switch (mode) {
     case DS4_THINK_LOW:
+        /* GLM 5.3 templates admit an explicit low level; models whose
+         * template does not keep the old low->high mapping. */
+        if (g_ds4_glm_template_low_effort) return "Reasoning Effort: Low";
+        return "Reasoning Effort: High";
     case DS4_THINK_MEDIUM:
     case DS4_THINK_HIGH: return "Reasoning Effort: High";
     case DS4_THINK_MAX:  return "Reasoning Effort: Max";

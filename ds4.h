@@ -317,6 +317,11 @@ bool ds4_think_mode_parse_level(const char *text, ds4_think_mode *out);
 const char *ds4_think_mode_name(ds4_think_mode mode);
 const char *ds4_think_max_prefix(void);
 const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode);
+/* GLM 5.3 low-effort template support, detected at model load from the
+ * embedded tokenizer.chat_template. Exposed for tests. */
+bool ds4_glm_template_supports_low_effort_str(const char *tmpl, size_t len);
+bool ds4_glm_template_low_effort_enabled(void);
+void ds4_glm_template_low_effort_set_for_test(bool on);
 uint32_t ds4_think_max_min_context(void);
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size);
 /* Uses the active model shape selected by ds4_engine_open(); call after opening

@@ -18467,6 +18467,64 @@ static void test_reasoning_effort_mapping(void) {
                                            (int)ds4_think_max_min_context()) == DS4_THINK_MAX);
 }
 
+static void test_glm_template_low_effort_detection(void) {
+    /* Opening lines of the official templates: GLM 5.3 Flash / Full select
+     * the effective effort from a list that admits 'low'; GLM 5.2 branches
+     * on == 'high' and has no low level. */
+    const char *glm53_flash =
+        "{%- set effective_reasoning_effort = reasoning_effort if "
+        "reasoning_effort is defined and reasoning_effort in "
+        "['low', 'high'] else 'max' -%}\n";
+    const char *glm53_full =
+        "{%- set default_reasoning_effort = 'max' -%}\n"
+        "{%- set effective_reasoning_effort = reasoning_effort if "
+        "reasoning_effort is defined and reasoning_effort in "
+        "['low', 'high'] else default_reasoning_effort -%}\n";
+    const char *glm52 =
+        "{%- if reasoning_effort == 'high' -%}"
+        "{%- set effective_reasoning_effort = 'high' -%}"
+        "{%- else -%}"
+        "{%- set effective_reasoning_effort = 'max' -%}"
+        "{%- endif -%}\n";
+    TEST_ASSERT(ds4_glm_template_supports_low_effort_str(
+        glm53_flash, strlen(glm53_flash)));
+    TEST_ASSERT(ds4_glm_template_supports_low_effort_str(
+        glm53_full, strlen(glm53_full)));
+    TEST_ASSERT(!ds4_glm_template_supports_low_effort_str(
+        glm52, strlen(glm52)));
+    TEST_ASSERT(!ds4_glm_template_supports_low_effort_str(NULL, 0));
+    TEST_ASSERT(!ds4_glm_template_supports_low_effort_str("no template", 11));
+}
+
+static void test_glm_reasoning_effort_levels(void) {
+    /* Per-level mapping for both template generations, plus the flag reset
+     * so other tests observe the default (old) mapping. */
+    ds4_glm_template_low_effort_set_for_test(false);
+    TEST_ASSERT(!ds4_glm_template_low_effort_enabled());
+    TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_LOW),
+                        "Reasoning Effort: High"));
+    TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_MEDIUM),
+                        "Reasoning Effort: High"));
+    TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_HIGH),
+                        "Reasoning Effort: High"));
+    TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_MAX),
+                        "Reasoning Effort: Max"));
+    TEST_ASSERT(ds4_glm_reasoning_effort_text(DS4_THINK_NONE) == NULL);
+
+    ds4_glm_template_low_effort_set_for_test(true);
+    TEST_ASSERT(ds4_glm_template_low_effort_enabled());
+    TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_LOW),
+                        "Reasoning Effort: Low"));
+    /* medium/xhigh render as high in every GLM generation; max and the
+     * unset default are unchanged. */
+    TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_MEDIUM),
+                        "Reasoning Effort: High"));
+    TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_MAX),
+                        "Reasoning Effort: Max"));
+    TEST_ASSERT(ds4_glm_reasoning_effort_text(DS4_THINK_NONE) == NULL);
+    ds4_glm_template_low_effort_set_for_test(false);
+}
+
 static void test_model_alias_thinking_controls(void) {
     TEST_ASSERT(model_alias_disables_thinking("deepseek-chat"));
     TEST_ASSERT(model_alias_disables_thinking("glm-5.2-chat"));
@@ -23212,6 +23270,8 @@ static void ds4_server_unit_tests_run(void) {
     test_request_defaults_use_min_p_filtering();
     test_chat_ignore_eos_contract();
     test_reasoning_effort_mapping();
+    test_glm_template_low_effort_detection();
+    test_glm_reasoning_effort_levels();
     test_model_alias_thinking_controls();
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();

@@ -95,3 +95,26 @@ block geometry against sizes spelled from ggml's block structs.
 ### docs: fix "gaol" -> "goal" in the README hardware section
 
 Typo fix only. (antirez/ds4#1173.)
+
+### glm: render GLM 5.3 low reasoning effort as Low
+
+GLM 5.3 (Flash and Full) chat templates accept `low` as a reasoning
+effort, but ds4 rendered a requested `low` as `Reasoning Effort: High`
+for every GLM model. The official 5.3 templates select the effective
+effort from `['low', 'high']` (else `max`); GLM 5.2 only branches on
+`== 'high'` and has no low level.
+
+An explicit `low` (and `minimal`, which already parses as low) now renders
+`Reasoning Effort: Low` when the loaded model's template supports it. The
+check runs once at model load on the `effective_reasoning_effort`
+statement of the embedded `tokenizer.chat_template`, covering GLM 5.3
+Flash (`glm5-next`) and Full GLM 5.3 (loading through the `glm-dsa`
+shape). A missing or unrecognized template keeps the old mapping, so GLM
+5.2 is unchanged. `medium`, `high`, `xhigh`, `max`, the unset default and
+disabled thinking are unchanged, as is every request form that names an
+effort (OpenAI `reasoning_effort`, `chat_template_kwargs`, Anthropic
+`output_config`/`thinking`, Responses `reasoning`).
+Verified by `test_glm_template_low_effort_detection` (template detection
+on the opening lines of the official 5.3 Flash, Full 5.3 and 5.2
+templates) and `test_glm_reasoning_effort_levels` (per-level mapping for
+both generations). (Implements antirez/ds4#1160.)
