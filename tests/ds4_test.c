@@ -4,9 +4,14 @@
 #include "../ds4_server.c"
 
 bool ds4_test_gguf_type_geometry(void);
+bool ds4_test_bpe_heap_matches_reference(void);
 
 static void test_gguf_type_geometry(void) {
     TEST_ASSERT(ds4_test_gguf_type_geometry());
+}
+
+static void test_bpe_heap_matches_reference(void) {
+    TEST_ASSERT(ds4_test_bpe_heap_matches_reference());
 }
 
 #ifndef DS4_NO_GPU
@@ -7235,6 +7240,7 @@ static const ds4_test_entry test_entries[] = {
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
     {"--gguf-types", "gguf-types", "GGUF quant type block geometry matches ggml block structs", test_gguf_type_geometry},
+    {"--bpe", "bpe", "heap BPE merge loop matches the reference O(n^2) loop token-for-token", test_bpe_heap_matches_reference},
 };
 
 static void test_print_help(const char *prog) {

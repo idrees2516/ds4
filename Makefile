@@ -69,7 +69,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm cpu-test bpe-tokenizer-bench
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench session-concurrency-bench check-mxfp4-half-lut
@@ -458,6 +458,29 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_eval_case
 	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o ds4_help.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o ds4_eval_cases.o ds4_help.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
+
+# CPU-only test battery: no GPU, no model, no Metal. Any Linux box (and
+# CI) can run the model-free regression surface: server parsing/rendering
+# and streaming units, GGUF type geometry, the BPE heap differential, and
+# the sampling reference comparison.
+ds4_test_cpu.o: tests/ds4_test.c ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
+	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -c -o $@ tests/ds4_test.c
+
+ds4_test_cpu: ds4_test_cpu.o ds4_help.o ds4_kvstore.o rax.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ ds4_test_cpu.o ds4_help.o ds4_kvstore.o rax.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o $(LDLIBS)
+
+speed-bench/bpe_tokenizer_bench: speed-bench/bpe_tokenizer_bench.c ds4.h ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -I. -o $@ speed-bench/bpe_tokenizer_bench.c ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o $(LDLIBS)
+
+.PHONY: bpe-tokenizer-bench cpu-test
+bpe-tokenizer-bench: speed-bench/bpe_tokenizer_bench
+	./speed-bench/bpe_tokenizer_bench
+
+cpu-test: ds4_test_cpu tests/test_sampling
+	./ds4_test_cpu --server
+	./ds4_test_cpu --gguf-types
+	./ds4_test_cpu --bpe
+	./tests/test_sampling
 
 cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke

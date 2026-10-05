@@ -158,3 +158,39 @@ token-sized pieces (one ending in a byte that could start the marker)
 and requires whole-piece deltas; `test_openai_chat_stream_splits_
 reasoning_without_tools` now pins the token-aligned shape instead of
 the old 20-byte cut. (Implements antirez/ds4#685.)
+
+### tokenizer: bpe_emit_piece merge loop is O(n log n), not O(n^2)
+
+The byte-level BPE merge loop rescanned every adjacent symbol pair on
+every merge iteration, so a piece of n symbols cost O(n^2) rank lookups.
+Real CJK prompts arrive from the pre-tokenizer as one long piece, which
+made a 24k-token request spend 3-4 minutes of pure CPU inside the
+tokenizer before prefill even started (39k chars measured ~90-180 s; 10x
+the text cost 80x the time).
+
+Only the two adjacencies around a merge point can change rank after a
+merge, so the loop now keeps a min-heap of candidate pair ranks with lazy
+validation (symbols carry a merge version; stale entries are dropped on
+pop) over a doubly-linked symbol list. Pop order is (rank, position) —
+lowest merge rank first, earliest pair on equal ranks — which reproduces
+the original merge selection exactly, so tokenization is byte-identical.
+Measured on the new `speed-bench/bpe_tokenizer_bench` (synthetic dense
+merges, no model needed): 1000 chars 3.8ms -> 0.19ms, 32k chars 4.76s ->
+7.3ms (~660x), with the heap and the reference loop emitting identical
+token sequences at every size.
+
+Correctness is pinned by `ds4_test --bpe`, a differential test that runs
+both implementations over 2000 random pieces against a synthetic
+vocabulary with colliding merge ranks (tie-breaking by position is
+exercised), plus the reference O(n^2) implementation retained under test
+hooks. (Implements antirez/ds4#853.)
+
+### build: make cpu-test runs the model-free regression battery on any box
+
+New `ds4_test_cpu` build and `make cpu-test` target: the server
+parsing/rendering/streaming unit group, the GGUF type geometry check, the
+BPE heap differential test, and the sampling reference comparison now run
+with no GPU, no Metal, and no model, on any Linux machine (and CI). The
+QA gate previously treated CPU builds as compile-only; the no-model
+surface is now executable everywhere. Also adds
+`make bpe-tokenizer-bench`.

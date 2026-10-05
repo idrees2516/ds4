@@ -42705,8 +42705,201 @@ static int bpe_rank(const ds4_vocab *vocab, const owned_str *a, const owned_str 
     return rank;
 }
 
-/* Apply byte-level BPE to one regex-like pre-tokenized piece and emit token ids. */
+/* Byte-level BPE symbol: one entry per original character, kept at a fixed
+ * array index for the whole merge loop. Dead symbols (absorbed by a merge)
+ * stay in place; prev/next skip over them, so list order equals index order
+ * and comparing indices reproduces left-to-right tie-breaking. ver counts the
+ * merges absorbed into this symbol so stale heap entries can be discarded. */
+typedef struct {
+    owned_str s;
+    int prev;
+    int next;
+    uint32_t ver;
+    bool alive;
+} bpe_symbol;
+
+/* Candidate merge between symbols left and right, ranked by the merge table.
+ * Entries are validated on pop (both alive, still adjacent, versions match);
+ * invalid ones are dropped instead of removed eagerly. */
+typedef struct {
+    int rank;
+    int left;
+    int right;
+    uint32_t left_ver;
+    uint32_t right_ver;
+} bpe_pair;
+
+/* Min-heap ordered by (rank, left index): lowest merge rank first, earliest
+ * pair on equal ranks, exactly like the historical full rescan. */
+typedef struct {
+    bpe_pair *v;
+    int len;
+    int cap;
+} bpe_pair_heap;
+
+static bool bpe_pair_less(const bpe_pair *a, const bpe_pair *b) {
+    if (a->rank != b->rank) return a->rank < b->rank;
+    return a->left < b->left;
+}
+
+static void bpe_heap_push(bpe_pair_heap *h, bpe_pair e) {
+    if (h->len == h->cap) {
+        h->cap = h->cap ? h->cap * 2 : 64;
+        h->v = xrealloc(h->v, (size_t)h->cap * sizeof(h->v[0]));
+    }
+    int i = h->len++;
+    h->v[i] = e;
+    while (i > 0) {
+        int p = (i - 1) / 2;
+        if (!bpe_pair_less(&h->v[i], &h->v[p])) break;
+        bpe_pair t = h->v[i];
+        h->v[i] = h->v[p];
+        h->v[p] = t;
+        i = p;
+    }
+}
+
+static bool bpe_heap_pop(bpe_pair_heap *h, bpe_pair *out) {
+    if (h->len == 0) return false;
+    *out = h->v[0];
+    h->v[0] = h->v[--h->len];
+    int i = 0;
+    for (;;) {
+        int l = 2 * i + 1;
+        int r = l + 1;
+        int m = i;
+        if (l < h->len && bpe_pair_less(&h->v[l], &h->v[m])) m = l;
+        if (r < h->len && bpe_pair_less(&h->v[r], &h->v[m])) m = r;
+        if (m == i) break;
+        bpe_pair t = h->v[i];
+        h->v[i] = h->v[m];
+        h->v[m] = t;
+        i = m;
+    }
+    return true;
+}
+
+static void bpe_symbol_concat_free(bpe_symbol *into, const bpe_symbol *right) {
+    owned_str merged;
+    merged.len = into->s.len + right->s.len;
+    merged.ptr = xmalloc((size_t)merged.len);
+    memcpy(merged.ptr, into->s.ptr, (size_t)into->s.len);
+    memcpy(merged.ptr + into->s.len, right->s.ptr, (size_t)right->s.len);
+    free(into->s.ptr);
+    into->s = merged;
+}
+
+/* Push the (left, right) adjacency as a candidate merge when the table ranks
+ * it. Called for every initial adjacency and for the two adjacencies each
+ * merge creates. */
+static void bpe_pair_offer(const ds4_vocab *vocab, bpe_pair_heap *h,
+                            bpe_symbol *sym, int left, int right) {
+    int rank = bpe_rank(vocab, &sym[left].s, &sym[right].s);
+    if (rank < 0) return;
+    bpe_pair e;
+    e.rank = rank;
+    e.left = left;
+    e.right = right;
+    e.left_ver = sym[left].ver;
+    e.right_ver = sym[right].ver;
+    bpe_heap_push(h, e);
+}
+
+/* Apply byte-level BPE to one regex-like pre-tokenized piece and emit token
+ * ids.  The merge loop is O(n log n): after a merge only the two surrounding
+ * adjacencies can change rank, so a validated min-heap of candidate pairs
+ * replaces the historical full rescan of every adjacency per merge (O(n^2)
+ * on long CJK pieces, where the pre-tokenizer emits one huge piece).  Pop
+ * order (rank, then position) reproduces the original merge selection
+ * exactly, so tokenization is byte-identical. */
 static void bpe_emit_piece(const ds4_vocab *vocab, ds4_str raw_piece, token_vec *out) {
+    uint64_t encoded_len = 0;
+    char *encoded = byte_encode(raw_piece, &encoded_len);
+    if (encoded_len == 0) {
+        free(encoded);
+        return;
+    }
+
+    int n_sym = 0;
+    int cap_sym = 32;
+    bpe_symbol *sym = xcalloc((size_t)cap_sym, sizeof(sym[0]));
+
+    for (uint64_t off = 0; off < encoded_len;) {
+        int n = utf8_len_from_first_byte((uint8_t)encoded[off]);
+        if (off + (uint64_t)n > encoded_len) n = 1;
+        if (n_sym == cap_sym) {
+            cap_sym *= 2;
+            sym = xrealloc(sym, (size_t)cap_sym * sizeof(sym[0]));
+            memset(sym + n_sym, 0, (size_t)(cap_sym - n_sym) * sizeof(sym[0]));
+        }
+        sym[n_sym].s = owned_copy(encoded + off, (uint64_t)n);
+        sym[n_sym].prev = n_sym - 1;
+        sym[n_sym].next = n_sym + 1;
+        sym[n_sym].ver = 0;
+        sym[n_sym].alive = true;
+        n_sym++;
+        off += (uint64_t)n;
+    }
+    /* The chain always ends at the last symbol; fix its tail link. */
+    sym[n_sym - 1].next = -1;
+
+    bpe_pair_heap heap = {0};
+    for (int i = 0; i + 1 < n_sym; i++) {
+        bpe_pair_offer(vocab, &heap, sym, i, i + 1);
+    }
+
+    bpe_pair e;
+    while (bpe_heap_pop(&heap, &e)) {
+        if (!sym[e.left].alive || !sym[e.right].alive) continue;
+        if (sym[e.left].next != e.right) continue;
+        if (sym[e.left].ver != e.left_ver || sym[e.right].ver != e.right_ver) continue;
+
+        /* Merge right into left: left keeps its index, its string grows, and
+         * right dies. Unlink right so the list order stays index order. */
+        bpe_symbol_concat_free(&sym[e.left], &sym[e.right]);
+        free(sym[e.right].s.ptr);
+        sym[e.right].s.ptr = NULL;
+        sym[e.right].s.len = 0;
+        sym[e.left].ver++;
+        sym[e.right].alive = false;
+        sym[e.left].next = sym[e.right].next;
+        if (sym[e.left].next >= 0) sym[sym[e.left].next].prev = e.left;
+
+        /* Only the two adjacencies around the merged symbol changed. */
+        if (sym[e.left].prev >= 0) {
+            bpe_pair_offer(vocab, &heap, sym, sym[e.left].prev, e.left);
+        }
+        if (sym[e.left].next >= 0) {
+            bpe_pair_offer(vocab, &heap, sym, e.left, sym[e.left].next);
+        }
+    }
+
+    for (int i = 0; i >= 0 && i < n_sym; i = sym[i].next) {
+        if (!sym[i].alive) continue;
+        int token = -1;
+        if (table_get(&vocab->token_to_id, sym[i].s.ptr, sym[i].s.len, &token)) {
+            token_vec_push(out, token);
+        } else {
+            for (uint64_t j = 0; j < sym[i].s.len; j++) {
+                if (table_get(&vocab->token_to_id, sym[i].s.ptr + j, 1, &token)) {
+                    token_vec_push(out, token);
+                }
+            }
+        }
+        free(sym[i].s.ptr);
+    }
+
+    free(sym);
+    free(heap.v);
+    free(encoded);
+}
+
+/* Reference/differential BPE hooks ship unconditionally: ds4_test links
+ * the production ds4.o, which has no DS4_TEST_HOOKS define (same contract
+ * as ds4_test_dspark_cache_window_crop). */
+/* Reference implementation of the historical O(n^2) merge loop, kept for the
+ * differential test: the heap rewrite must produce byte-identical output. */
+static void bpe_emit_piece_reference(const ds4_vocab *vocab, ds4_str raw_piece, token_vec *out) {
     uint64_t encoded_len = 0;
     char *encoded = byte_encode(raw_piece, &encoded_len);
 
@@ -42772,6 +42965,113 @@ static void bpe_emit_piece(const ds4_vocab *vocab, ds4_str raw_piece, token_vec 
     free(sym);
     free(encoded);
 }
+
+/* Synthetic vocabulary for the BPE differential test and the tokenizer
+ * benchmark: single byte-encoded characters as tokens, and a merge table
+ * pairing them with colliding ranks so tie-breaking by position matters. */
+void ds4_test_bpe_vocab_build(void *vocab_out) {
+    ds4_vocab *vocab = vocab_out;
+    memset(vocab, 0, sizeof(*vocab));
+    table_init(&vocab->token_to_id, 64);
+    table_init(&vocab->merge_rank, 64);
+
+    /* Tokens: single byte-encoded characters. The byte encoder maps bytes to
+     * 2-3 UTF-8 bytes, so build keys from the encoded form directly. */
+    static char key_pool[256][8];
+    int n_keys = 0;
+    char single[8];
+    for (int c = 32; c < 127; c++) {
+        char *p = single;
+        utf8_put(&p, gpt2_byte_to_codepoint((uint8_t)c));
+        uint64_t len = (uint64_t)(p - single);
+        memcpy(key_pool[n_keys], single, (size_t)len);
+        ds4_str key = {key_pool[n_keys], len};
+        table_put(&vocab->token_to_id, key, n_keys);
+        n_keys++;
+    }
+
+    /* Merges over encoded strings: join two encoded characters with a space,
+     * in a deliberately mixed rank order. Ranks 0..9 with collisions across
+     * different pairs to exercise the (rank, position) tie-breaking. */
+    static char merge_pool[64][16];
+    int n_merges = 0;
+    int rank = 0;
+    for (int i = 0; i < 5 && n_merges < 60; i++) {
+        for (int j = 0; j < 5 && n_merges < 60; j++) {
+            /* (i,j) and (j,i) get the same rank in different insertion
+             * order: ties must resolve by position, not table order. */
+            for (int rep = 0; rep < 2 && n_merges < 60; rep++) {
+                int a = rep ? j : i;
+                int b = rep ? i : j;
+                char *p = merge_pool[n_merges];
+                utf8_put(&p, gpt2_byte_to_codepoint((uint8_t)('a' + a)));
+                *p++ = ' ';
+                utf8_put(&p, gpt2_byte_to_codepoint((uint8_t)('b' + b)));
+                size_t off = (size_t)(p - merge_pool[n_merges]);
+                ds4_str key = {merge_pool[n_merges], off};
+                table_put(&vocab->merge_rank, key, rank);
+                n_merges++;
+            }
+            rank++;
+        }
+    }
+}
+
+void ds4_test_bpe_vocab_free(void *vocab_out) {
+    ds4_vocab *vocab = vocab_out;
+    table_free(&vocab->token_to_id);
+    table_free(&vocab->merge_rank);
+}
+
+void ds4_test_bpe_emit(const void *vocab_in, const char *ptr, uint64_t len,
+                       ds4_tokens *out, bool reference) {
+    const ds4_vocab *vocab = vocab_in;
+    ds4_str raw = {ptr, len};
+    if (reference) bpe_emit_piece_reference(vocab, raw, out);
+    else bpe_emit_piece(vocab, raw, out);
+}
+
+/* Differential test: build a synthetic vocabulary with a merge table of
+ * every-length pairings, then require the heap merge loop and the reference
+ * O(n^2) loop to emit identical token sequences for random pieces. This
+ * pins merge ORDER, not just the final token multiset. */
+bool ds4_test_bpe_heap_matches_reference(void) {
+    ds4_vocab vocab;
+    ds4_test_bpe_vocab_build(&vocab);
+
+    uint64_t rng = 0x9e3779b97f4a7c15ULL;
+    char piece[512];
+    bool ok = true;
+    for (int iter = 0; iter < 2000 && ok; iter++) {
+        int len = 1 + (int)(rng % 60);
+        for (int i = 0; i < len; i++) {
+            rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+            piece[i] = (char)('a' + (int)(rng % 5));
+        }
+        ds4_str raw = {piece, (uint64_t)len};
+
+        token_vec fast = {0};
+        token_vec ref = {0};
+        bpe_emit_piece(&vocab, raw, &fast);
+        bpe_emit_piece_reference(&vocab, raw, &ref);
+        if (fast.len != ref.len) {
+            ok = false;
+        } else {
+            for (int i = 0; i < fast.len; i++) {
+                if (fast.v[i] != ref.v[i]) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        free(fast.v);
+        free(ref.v);
+    }
+
+    ds4_test_bpe_vocab_free(&vocab);
+    return ok;
+}
+
 
 static uint64_t next_utf8_char(const char *s, uint64_t len, uint64_t pos) {
     int n = utf8_len_from_first_byte((uint8_t)s[pos]);
