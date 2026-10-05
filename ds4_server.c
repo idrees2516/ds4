@@ -856,6 +856,9 @@ typedef struct {
     stop_list anthropic_live_call_ids;
     char *anthropic_live_suffix_text;
     tool_replay_stats tool_replay;
+    /* Set when a client stop_sequences entry ended the generation; the
+     * Anthropic surface reports it back as stop_sequence. NULL otherwise. */
+    char *matched_stop;
 } request;
 
 static void tool_call_free(tool_call *tc) {
@@ -1017,6 +1020,7 @@ static void request_free(request *r) {
     free(r->model);
     for (int i = 0; i < r->stops.len; i++) free(r->stops.v[i]);
     free(r->stops.v);
+    free(r->matched_stop);
     free(r->raw_body);
     free(r->prompt_text);
     stop_list_clear(&r->responses_live_call_ids);
@@ -1309,24 +1313,30 @@ static bool parse_stop(const char **p, stop_list *out) {
 }
 
 static bool stop_list_find_from(const stop_list *stops, const char *text,
-                                size_t from, size_t *pos, size_t *len) {
+                                size_t from, size_t *pos, size_t *len,
+                                char **matched_out) {
     if (!stops->len || !text) return false;
     bool found = false;
     size_t best_pos = 0, best_len = 0;
+    char *best_match = NULL;
     for (int i = 0; i < stops->len; i++) {
         const char *p = strstr(text + from, stops->v[i]);
         if (!p) continue;
         size_t ppos = (size_t)(p - text);
         size_t plen = strlen(stops->v[i]);
+        /* Earliest position wins; strict '<' keeps first-listed order on ties
+         * so the reported sequence matches the entry the client sent first. */
         if (!found || ppos < best_pos) {
             found = true;
             best_pos = ppos;
             best_len = plen;
+            best_match = stops->v[i];
         }
     }
     if (!found) return false;
     *pos = best_pos;
     *len = best_len;
+    if (matched_out) *matched_out = best_match;
     return true;
 }
 
@@ -8676,7 +8686,9 @@ static bool responses_sse_completed(int fd, const request *r,
         buf_puts(&b, ",\"error\":{\"code\":\"server_error\","
                      "\"message\":\"generation failed\"}");
     } else if (!strcmp(event_type, "response.incomplete")) {
-        buf_puts(&b, ",\"incomplete_details\":{\"reason\":\"max_tokens\"}");
+        /* OpenAI's Responses vocabulary: incomplete_details.reason is
+         * "max_output_tokens" (or "content_filter"), never "max_tokens". */
+        buf_puts(&b, ",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}");
     }
     const char *item_status = responses_item_status_for_finish(finish);
     buf_puts(&b, ",\"output\":[");
@@ -8950,7 +8962,7 @@ static bool responses_final_response(int fd, bool enable_cors,
         buf_puts(&b, ",\"error\":{\"code\":\"server_error\","
                      "\"message\":\"generation failed\"}");
     } else if (finish && !strcmp(finish, "length")) {
-        buf_puts(&b, ",\"incomplete_details\":{\"reason\":\"max_tokens\"}");
+        buf_puts(&b, ",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}");
     }
     buf_puts(&b, ",\"output\":[");
     bool wrote = false;
@@ -9035,9 +9047,16 @@ static bool final_response(int fd, bool enable_cors,
     return ok;
 }
 
-static const char *anthropic_stop_reason(const char *finish) {
+static const char *anthropic_stop_reason(const request *r, const char *finish) {
     if (finish && !strcmp(finish, "tool_calls")) return "tool_use";
     if (finish && !strcmp(finish, "length")) return "max_tokens";
+    /* A client stop_sequences hit is reported verbatim by the Anthropic API:
+     * stop_reason "stop_sequence" plus the matched string in stop_sequence. */
+    if (r && r->matched_stop) return "stop_sequence";
+    /* Anthropic has no error stop_reason. finish == "error" stays end_turn
+     * and the failure is surfaced out-of-band: an "error" field on the
+     * message object (non-streaming) and an SSE error event (streaming), so
+     * clients that ignore unknown fields keep working. */
     return "end_turn";
 }
 
@@ -9113,15 +9132,26 @@ static void append_anthropic_usage_json(buf *b, const request *r,
 static bool anthropic_final_response(int fd, bool enable_cors,
                                      const request *r, const char *id, const char *text,
                                      const char *reasoning, const tool_calls *calls, const char *finish,
-                                     int prompt_tokens, int completion_tokens) {
+                                     const char *error, int prompt_tokens, int completion_tokens) {
     buf b = {0};
     buf_printf(&b, "{\"id\":\"%s\",\"type\":\"message\",\"role\":\"assistant\",\"model\":", id);
     json_escape(&b, r->model);
     buf_puts(&b, ",\"content\":");
     append_anthropic_content(&b, text, reasoning, calls, id, &r->tool_orders);
     buf_puts(&b, ",\"stop_reason\":");
-    json_escape(&b, anthropic_stop_reason(finish));
-    buf_puts(&b, ",\"stop_sequence\":null,\"usage\":");
+    json_escape(&b, anthropic_stop_reason(r, finish));
+    buf_puts(&b, ",\"stop_sequence\":");
+    if (r->matched_stop) json_escape(&b, r->matched_stop);
+    else buf_puts(&b, "null");
+    /* Out-of-band failure visibility: keep the stop_reason vocabulary clean,
+     * but let clients that inspect the message object tell a failed turn from
+     * a normal end_turn (mirrors the SSE error event on the streaming path). */
+    if (finish && !strcmp(finish, "error")) {
+        buf_puts(&b, ",\"error\":{\"type\":\"api_error\",\"message\":");
+        json_escape(&b, error && error[0] ? error : "generation failed");
+        buf_putc(&b, '}');
+    }
+    buf_puts(&b, ",\"usage\":");
     append_anthropic_usage_json(&b, r, prompt_tokens, completion_tokens);
     buf_puts(&b, "}\n");
     bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
@@ -9821,12 +9851,15 @@ static bool anthropic_sse_tool_blocks_live(int fd, const request *r, const char 
     return true;
 }
 
-static bool anthropic_sse_stop_live(int fd, const char *finish,
+static bool anthropic_sse_stop_live(int fd, const request *r, const char *finish,
                                     int completion_tokens) {
     buf b = {0};
     buf_puts(&b, "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":");
-    json_escape(&b, anthropic_stop_reason(finish));
-    buf_puts(&b, ",\"stop_sequence\":null},\"usage\":{\"output_tokens\":");
+    json_escape(&b, anthropic_stop_reason(r, finish));
+    buf_puts(&b, ",\"stop_sequence\":");
+    if (r && r->matched_stop) json_escape(&b, r->matched_stop);
+    else buf_puts(&b, "null");
+    buf_puts(&b, "},\"usage\":{\"output_tokens\":");
     buf_printf(&b, "%d}}", completion_tokens);
     bool ok = sse_event(fd, "message_delta", b.ptr);
     buf_free(&b);
@@ -9837,7 +9870,8 @@ static bool anthropic_sse_stop_live(int fd, const char *finish,
 static bool anthropic_sse_finish_live(int fd, server *s, const request *r, const char *id,
                                       anthropic_stream *st, const char *raw,
                                       size_t raw_len, const tool_calls *calls,
-                                      const char *finish, int completion_tokens) {
+                                      const char *finish, int completion_tokens,
+                                      const char *error) {
     if (!anthropic_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
 
     if (st->sent_thinking && !st->sent_text && (!calls || calls->len == 0)) {
@@ -9846,7 +9880,13 @@ static bool anthropic_sse_finish_live(int fd, server *s, const request *r, const
     }
 
     if (!anthropic_sse_tool_blocks_live(fd, r, id, st, calls)) return false;
-    return anthropic_sse_stop_live(fd, finish, completion_tokens);
+    /* A failed turn must be visible to Anthropic clients: the SSE error event
+     * (type: error / api_error) precedes the normal terminator so clients see
+     * both the failure and a well-formed stream end. */
+    if (finish && !strcmp(finish, "error")) {
+        if (!sse_error_event(fd, r, error)) return false;
+    }
+    return anthropic_sse_stop_live(fd, r, finish, completion_tokens);
 }
 
 static double now_sec(void) {
@@ -14064,9 +14104,10 @@ decode_again:
             }
 
             size_t stop_pos = 0, stop_len = 0;
+            char *stop_match = NULL;
             bool hit_stop = stop_list_find_from(&j->req.stops, text.ptr,
                                                 stop_scan_from,
-                                                &stop_pos, &stop_len);
+                                                &stop_pos, &stop_len, &stop_match);
             size_t stream_len = hit_stop ?
                 stop_pos : stop_list_stream_safe_len(&j->req.stops, text.len);
             if (stream_len > text.len) stream_len = text.len;
@@ -14213,6 +14254,10 @@ decode_again:
                 finish = "stop";
                 stop_detail = "client stop sequence";
                 client_stop = true;
+                /* Remember which entry matched so the Anthropic surface can
+                 * report stop_reason "stop_sequence" with the matched string. */
+                free(j->req.matched_stop);
+                j->req.matched_stop = xstrdup(stop_match);
                 text.len = stop_pos;
                 text.ptr[text.len] = '\0';
                 pthread_mutex_lock(&s->inference_mu);
@@ -14355,9 +14400,21 @@ decode_again:
                 snprintf(err, sizeof(err), "invalid tool call recovery failed: %s",
                          recovery_err[0] ? recovery_err : "unknown error");
             } else {
-                finish = "error";
-                snprintf(err, sizeof(err), "unterminated tool call (%s; token=%d, generated=%d, limit=%d)",
-                         stop_detail, stop_token, completion, max_tokens);
+                /* An unclosed envelope is a model output shape (truncated or
+                 * rambling generation), not a server fault. Leave finish alone
+                 * so the response parser's recovered_tool_parse_failure path
+                 * degrades it to assistant text with finish_reason "stop",
+                 * exactly like an uncloseable-but-complete envelope. Operators
+                 * still see the WARNING below plus the trace event. */
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: chat ctx=%s%s%s unterminated tool call degraded to assistant text (%s; token=%d, generated=%d, limit=%d)",
+                           ctx_span,
+                           req_flags[0] ? " " : "",
+                           req_flags,
+                           stop_detail, stop_token, completion, max_tokens);
+                trace_event(s, trace_id,
+                            "unterminated tool call deferred to parse-failure recovery (stop=%s token=%d generated=%d limit=%d)",
+                            stop_detail, stop_token, completion, max_tokens);
             }
         }
         buf_free(&repaired);
@@ -14607,7 +14664,8 @@ decode_again:
         if (j->req.api == API_ANTHROPIC) {
             response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, id, &anthropic_live,
                                                     text.ptr ? text.ptr : "", text.len,
-                                                    &parsed_calls, final_finish, completion);
+                                                    &parsed_calls, final_finish, completion,
+                                                    err[0] ? err : NULL);
         } else if (openai_live_chat) {
             response_ok = openai_sse_finish_live(j->fd, s, &j->req, id, &openai_live,
                                                  text.ptr ? text.ptr : "", text.len,
@@ -14641,6 +14699,7 @@ decode_again:
                                                parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                                                parsed_reasoning,
                                                &parsed_calls, final_finish,
+                                               err[0] ? err : NULL,
                                                prompt_tokens, completion);
     } else if (response_ok && j->req.api == API_RESPONSES) {
         response_ok = responses_final_response(j->fd, s->enable_cors, &j->req, id,
@@ -17212,7 +17271,7 @@ static void test_anthropic_live_stream_sends_incremental_blocks(void) {
     tool_calls calls = make_swapped_bash_call();
     TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_test", &st,
                                           raw, strlen(raw), &calls,
-                                          "tool_calls", 8));
+                                          "tool_calls", 8, NULL));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -17263,7 +17322,7 @@ static void test_anthropic_stream_reroutes_second_reasoning_pass(void) {
     const char *complete = "first pass</think>escaped draft</think>final answer";
     TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_second_think",
                                           &st, complete, strlen(complete), NULL,
-                                          "stop", 9));
+                                          "stop", 9, NULL));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -17325,7 +17384,7 @@ static void test_anthropic_tool_stream_sends_live_tool_use(void) {
     TEST_ASSERT(!strncmp(calls.v[0].id, "toolu_", 6));
     TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_tool", &st,
                                           raw_complete, strlen(raw_complete),
-                                          &calls, "tool_calls", 5));
+                                          &calls, "tool_calls", 5, NULL));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -17379,7 +17438,7 @@ static void test_anthropic_usage_reports_cache_details(void) {
         return;
     }
 
-    TEST_ASSERT(anthropic_final_response(sv[0], false, &r, "msg_usage", "OK", NULL, NULL, "stop", 10, 2));
+    TEST_ASSERT(anthropic_final_response(sv[0], false, &r, "msg_usage", "OK", NULL, NULL, "stop", NULL, 10, 2));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -17672,6 +17731,216 @@ static void test_responses_usage_reports_cache_details(void) {
     close(sv[0]);
     close(sv[1]);
     request_free(&r);
+}
+
+static void test_anthropic_stop_sequence_reported(void) {
+    /* Full (non-streaming) message: a client stop_sequences hit is reported
+     * as stop_reason "stop_sequence" with the matched string, mirroring the
+     * Anthropic Messages API; without a match the fields keep their old
+     * end_turn / null shape. */
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    r.matched_stop = xstrdup("5");
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        request_free(&r);
+        return;
+    }
+    TEST_ASSERT(anthropic_final_response(sv[0], false, &r, "msg_stopseq", "1, 2, 3, 4, ",
+                                         NULL, NULL, "stop", NULL, 8, 5));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"stop_reason\":\"stop_sequence\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"stop_sequence\":\"5\"") != NULL);
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+    free(r.matched_stop);
+    r.matched_stop = NULL;
+
+    /* Plain end of turn: stop_reason stays end_turn and stop_sequence null. */
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        request_free(&r);
+        return;
+    }
+    TEST_ASSERT(anthropic_final_response(sv[0], false, &r, "msg_endturn", "done",
+                                         NULL, NULL, "stop", NULL, 4, 1));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"stop_reason\":\"end_turn\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"stop_sequence\":null") != NULL);
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    /* Streamed message_delta carries the same pair. */
+    r.stream = true;
+    r.matched_stop = xstrdup("5");
+    anthropic_stream st;
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        request_free(&r);
+        return;
+    }
+    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_stopseq_stream", 8, &st));
+    TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_stopseq_stream", &st,
+                                          "1, 2, 3, 4, ", strlen("1, 2, 3, 4, "),
+                                          NULL, "stop", 5, NULL));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"stop_reason\":\"stop_sequence\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"stop_sequence\":\"5\"") != NULL);
+    TEST_ASSERT(strstr(out, "event: message_stop") != NULL);
+    free(out);
+    anthropic_stream_free(&st);
+    close(sv[0]);
+    close(sv[1]);
+    request_free(&r);
+}
+
+static void test_anthropic_error_finish_is_visible(void) {
+    /* A failed turn must be visible on the Anthropic surface even though the
+     * stop_reason vocabulary has no error member: the full message carries an
+     * "error" field and the stream emits a type: error SSE event before the
+     * terminator. */
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        request_free(&r);
+        return;
+    }
+    TEST_ASSERT(anthropic_final_response(sv[0], false, &r, "msg_err", "partial",
+                                         NULL, NULL, "error", "engine fault", 4, 2));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"stop_reason\":\"end_turn\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"error\":{\"type\":\"api_error\",\"message\":\"engine fault\"}") != NULL);
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    r.stream = true;
+    anthropic_stream st;
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        request_free(&r);
+        return;
+    }
+    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_err_stream", 8, &st));
+    TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_err_stream", &st,
+                                          "partial", strlen("partial"),
+                                          NULL, "error", 2, "engine fault"));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "event: error") != NULL);
+    TEST_ASSERT(strstr(out, "\"type\":\"api_error\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"message\":\"engine fault\"") != NULL);
+    /* The stream still terminates cleanly after the error event. */
+    TEST_ASSERT(strstr(out, "event: message_stop") != NULL);
+    free(out);
+    anthropic_stream_free(&st);
+    close(sv[0]);
+    close(sv[1]);
+    request_free(&r);
+}
+
+static void test_responses_incomplete_reason_is_max_output_tokens(void) {
+    /* OpenAI's Responses API spells incomplete_details.reason
+     * "max_output_tokens"; clients branch on the exact string. Both the
+     * non-streaming response and the streamed response.incomplete event must
+     * agree. */
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        request_free(&r);
+        return;
+    }
+    TEST_ASSERT(responses_final_response(sv[0], false, &r, "resp_inc", "1, 2, 3",
+                                         NULL, NULL, "length", 6, 3));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"status\":\"incomplete\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"incomplete_details\":{\"reason\":\"max_output_tokens\"}") != NULL);
+    TEST_ASSERT(strstr(out, "\"reason\":\"max_tokens\"") == NULL);
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    responses_stream st;
+    responses_stream_init(&r, &st);
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        request_free(&r);
+        return;
+    }
+    TEST_ASSERT(responses_sse_completed(sv[0], &r, &st, NULL, NULL,
+                                        "length", 6, 3, 1234));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "response.incomplete") != NULL);
+    TEST_ASSERT(strstr(out, "\"incomplete_details\":{\"reason\":\"max_output_tokens\"}") != NULL);
+    TEST_ASSERT(strstr(out, "\"reason\":\"max_tokens\"") == NULL);
+    free(out);
+    responses_stream_free(&st);
+    close(sv[0]);
+    close(sv[1]);
+    request_free(&r);
+}
+
+static void test_unterminated_tool_call_degrades_to_assistant_text(void) {
+    /* An opened-but-never-closed tool envelope is a model output shape, not a
+     * server fault: the response parser must be allowed to run its
+     * recovered_tool_parse_failure degrade (assistant text + finish stop),
+     * which requires the generation loop not to preset finish "error". This
+     * pins the parser half of that contract: with saw_tool_start and a
+     * non-error finish, the degrade applies; with finish "error" it must not
+     * (genuine faults keep their error). */
+    const char *text = "Let me check.\n" DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\">ls -la";
+    const char *finish = "stop";
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    bool recovered = false;
+    char err[128] = {0};
+    const bool parsed_ok = parse_generated_message_for_response_for_syntax(
+        SERVER_MODEL_SYNTAX_DEEPSEEK, text, true, true, false,
+        &finish, err, sizeof(err), &content, &reasoning, &calls, &recovered, NULL);
+    TEST_ASSERT(!parsed_ok);
+    TEST_ASSERT(recovered);
+    TEST_ASSERT(!strcmp(finish, "stop"));
+    TEST_ASSERT(content && !strcmp(content, text));
+    TEST_ASSERT(calls.len == 0);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+
+    finish = "error";
+    recovered = false;
+    content = reasoning = NULL;
+    memset(&calls, 0, sizeof(calls));
+    err[0] = '\0';
+    const bool parsed_ok_err = parse_generated_message_for_response_for_syntax(
+        SERVER_MODEL_SYNTAX_DEEPSEEK, text, true, true, false,
+        &finish, err, sizeof(err), &content, &reasoning, &calls, &recovered, NULL);
+    TEST_ASSERT(!parsed_ok_err);
+    TEST_ASSERT(!recovered);
+    TEST_ASSERT(!strcmp(finish, "error"));
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
 }
 
 static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
@@ -20799,9 +21068,11 @@ static void test_stop_list_parses_all_sequences(void) {
     TEST_ASSERT(stops.max_len == 4);
 
     size_t pos = 0, len = 0;
-    TEST_ASSERT(stop_list_find_from(&stops, "hello STOP tail END", 0, &pos, &len));
+    char *match = NULL;
+    TEST_ASSERT(stop_list_find_from(&stops, "hello STOP tail END", 0, &pos, &len, &match));
     TEST_ASSERT(pos == strlen("hello "));
     TEST_ASSERT(len == strlen("STOP"));
+    TEST_ASSERT(match && !strcmp(match, "STOP"));
     TEST_ASSERT(stop_list_stream_safe_len(&stops, strlen("abcdef")) == 3);
     stop_list_clear(&stops);
     free(stops.v);
@@ -20816,9 +21087,11 @@ static void test_stop_list_streaming_holds_and_trims_stop_text(void) {
     TEST_ASSERT(safe == strlen("hel"));
 
     size_t pos = 0, len = 0;
-    TEST_ASSERT(stop_list_find_from(&stops, "answer STOP hidden", 0, &pos, &len));
+    char *match = NULL;
+    TEST_ASSERT(stop_list_find_from(&stops, "answer STOP hidden", 0, &pos, &len, &match));
     TEST_ASSERT(pos == strlen("answer "));
     TEST_ASSERT(len == strlen("STOP"));
+    TEST_ASSERT(match && !strcmp(match, "STOP"));
 
     stop_list_clear(&stops);
     free(stops.v);
@@ -22984,6 +23257,8 @@ static void ds4_server_unit_tests_run(void) {
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_stream_reroutes_second_reasoning_pass();
     test_anthropic_usage_reports_cache_details();
+    test_anthropic_stop_sequence_reported();
+    test_anthropic_error_finish_is_visible();
     test_anthropic_tool_stream_sends_live_tool_use();
     test_openai_tool_stream_sends_incremental_text();
     test_openai_stream_reroutes_second_reasoning_pass();
@@ -22991,6 +23266,8 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_stream_split_reasoning_close();
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();
+    test_responses_incomplete_reason_is_max_output_tokens();
+    test_unterminated_tool_call_degrades_to_assistant_text();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
     test_openai_glm_tool_stream_suppresses_raw_tool_call();
